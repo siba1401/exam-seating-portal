@@ -920,878 +920,1479 @@ const ROOM_DEFAULTS = {
     },
 
 };
+/* ═══════════════════════════════════════════════════════════════════
+   NMIMS Supervisor Portal — Application Logic
+   -------------------------------------------------------------------
+   A "session" is one invigilation unit = Room + Exam Date + Exam Time.
+   Every row of the seating plan file belongs to exactly one session,
+   and every session produces one supervisor report. Reports are built
+   for all sessions automatically once both files are uploaded; the
+   room layout is taken from ROOM_DEFAULTS for the allotted room.
+   ═══════════════════════════════════════════════════════════════════ */
 
-// State
+/* Column order used when filling seats, per layout type. */
+const SIDE_ORDER = {
+    auditorium: ["left", "middle", "right"],
+    lab: ["left", "middle", "right"],
+    straight_quad: ["left", "mid1", "mid2", "right"],
+    straight_penta: ["left", "mid1", "mid2", "mid3", "right"],
+    straight_hexa: ["left", "mid1", "mid2", "mid3", "mid4", "right"]
+};
+
+const MONTHS = {
+    jan: 0, january: 0, feb: 1, february: 1, mar: 2, march: 2, apr: 3, april: 3,
+    may: 4, jun: 5, june: 5, jul: 6, july: 6, aug: 7, august: 7, sep: 8, sept: 8,
+    september: 8, oct: 9, october: 9, nov: 10, november: 10, dec: 11, december: 11
+};
+
+/* ─── State ──────────────────────────────────────────────────────── */
 const state = {
     rollFile: null,
     metaFile: null,
     rollData: null,
     metaData: null,
-    rooms: [...DEFAULT_ROOMS],
-    selectedRoom: DEFAULT_ROOMS[0],
-    rowConfigs: [],
-    academicYear: "2025-26",
+    sessions: [],          // every generated report, date-ordered
+    view: [],              // indices of sessions matching the active filter
+    current: 0,            // index into state.sessions
+    overrides: {},         // room name -> { layoutType, totalRows, rowConfigs }
+    academicYear: "",
     examType: "Final Exam",
-    layoutType: "auditorium",
-    alternateSeating: false,
     interleaveBatches: false,
-    startDirection: "left"
+    startDirection: "left",
+    scale: "lg",
+    printMode: "sidebyside", // "sidebyside" = one sheet, records in a right column
+                             // "stacked"     = one sheet, records below the plan
+                             // "full"        = two sheets, largest type
+    allRendered: false
 };
 
-// ─── DOM refs ────────────────────────────────────────────────────────
 const uploadView = () => document.getElementById("uploadView");
 const reportView = () => document.getElementById("reportView");
+const $ = (id) => document.getElementById(id);
 
-// ─── Init ────────────────────────────────────────────────────────────
+/* ─── Init ───────────────────────────────────────────────────────── */
 document.addEventListener("DOMContentLoaded", () => {
-    buildRowConfigs(6);
     bindUploadCards();
     bindSidebarControls();
+    bindToolbar();
     bindGenerateBtn();
+    applyScale(state.scale);
+    applyPrintMode(state.printMode);
 
-    // Initial room population
-    const sel = document.getElementById("roomSelect");
-    if (sel) {
-        sel.innerHTML = DEFAULT_ROOMS.map((r) => `<option value="${r}">${r}</option>`).join("");
-        sel.disabled = false;
-        applyRoomDefaults(state.selectedRoom);
-    }
-
-    // Load SheetJS from CDN dynamically
-    if (!window.XLSX) {
-        const s = document.createElement("script");
-        s.src = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
-        s.onload = () => console.log("SheetJS ready");
-        document.head.appendChild(s);
+    if (typeof DecompressionStream === "undefined") {
+        setStatus("This browser is too old to read .xlsx files. "
+            + "Please use a current version of Chrome, Edge or Firefox.", true);
     }
 });
 
-// ─── Sidebar Controls ────────────────────────────────────────────────
-function bindSidebarControls() {
-    const ayInput = document.getElementById("academicYear");
-    const exSelect = document.getElementById("examType");
-    const rowCountInput = document.getElementById("totalRows");
-    const layoutSelect = document.getElementById("layoutType");
-
-    ayInput.addEventListener("input", () => {
-        state.academicYear = ayInput.value.trim() || "2025-26";
-    });
-    exSelect.addEventListener("change", () => {
-        state.examType = exSelect.value;
-    });
-    rowCountInput.addEventListener("change", () => {
-        const n = Math.max(1, Math.min(25, parseInt(rowCountInput.value) || 6));
-        rowCountInput.value = n;
-        buildRowConfigs(n);
-    });
-    layoutSelect.addEventListener("change", () => {
-        state.layoutType = layoutSelect.value;
-        const n = Math.max(1, Math.min(25, parseInt(rowCountInput.value) || 6));
-        buildRowConfigs(n);
-    });
-
-    const interleaveChk = document.getElementById("interleaveBatches");
-    if (interleaveChk) {
-        interleaveChk.addEventListener("change", () => {
-            state.interleaveBatches = interleaveChk.checked;
-        });
-    }
-
-    const startDirSelect = document.getElementById("startDirection");
-    if (startDirSelect) {
-        startDirSelect.addEventListener("change", () => {
-            state.startDirection = startDirSelect.value;
-        });
-    }
-
-    document.getElementById("updateLayoutBtn").addEventListener("click", () => {
-        if (state.selectedRoom) generateReport();
-        else alert("Please select a room first.");
-    });
-
-    // Room Select change listener
-    const sel = document.getElementById("roomSelect");
-    if (sel) {
-        sel.addEventListener("change", () => handleRoomChange(sel.value));
-    }
+/* ─── Small helpers ──────────────────────────────────────────────── */
+function normalizeStr(s) {
+    if (s === 0) return "0";
+    if (!s) return "";
+    return String(s).trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-// Helper to keep both room dropdowns in sync and apply logic
-function handleRoomChange(val) {
-    state.selectedRoom = val;
-
-    // Sync sidebar dropdown
-    const s1 = document.getElementById("roomSelect");
-    if (s1 && s1.value !== val) s1.value = val;
-
-    // Sync toolbar dropdown (if it exists)
-    const s2 = document.getElementById("toolbarRoomSelect");
-    if (s2 && s2.value !== val) s2.value = val;
-
-    applyRoomDefaults(val);
-    generateReport();
+function squash(s) {
+    return normalizeStr(s).replace(/[\s.\-_]/g, "");
 }
 
-// ─── Row Config Builder ───────────────────────────────────────────────
-function buildRowConfigs(n) {
-    const container = document.getElementById("rowConfigsList");
-    container.innerHTML = "";
-    state.rowConfigs = [];
+function titleCaseSubject(s) {
+    const str = String(s || "").trim();
+    if (!str) return "";
+    if (str !== str.toUpperCase()) return str;          // already mixed case
+    return str.toLowerCase().replace(/\b([a-z])/g, (m, c) => c.toUpperCase());
+}
 
-    for (let i = 1; i <= n; i++) {
-        let cfg;
-        if (state.layoutType === "straight_quad") {
-            cfg = { left: 2, mid1: 2, mid2: 2, right: 2 };
-        } else if (state.layoutType === "straight_penta") {
-            cfg = { left: 2, mid1: 2, mid2: 2, mid3: 2, right: 2 };
-        } else if (state.layoutType === "straight_hexa") {
-            cfg = { left: 2, mid1: 2, mid2: 2, mid3: 2, mid4: 2, right: 2 };
-        } else {
-            cfg = { left: 2, middle: (state.layoutType === "auditorium" ? 0 : 2), right: 2 };
-        }
-        state.rowConfigs.push(cfg);
+function extractNum(val) {
+    const m = String(val).match(/\d+/);
+    return m ? parseInt(m[0], 10) : NaN;
+}
 
-        const item = document.createElement("div");
-        item.className = "row-config-item";
-
-        let gridHTML = "";
-        if (state.layoutType === "straight_quad") {
-            gridHTML = `
-          <div>
-            <div class="seat-input-label">Left</div>
-            <input class="seat-input" type="number" min="0" max="12" value="${cfg.left}" data-row="${i - 1}" data-side="left">
-          </div>
-          <div>
-            <div class="seat-input-label">Mid 1</div>
-            <input class="seat-input" type="number" min="0" max="12" value="${cfg.mid1}" data-row="${i - 1}" data-side="mid1">
-          </div>
-          <div>
-            <div class="seat-input-label">Mid 2</div>
-            <input class="seat-input" type="number" min="0" max="12" value="${cfg.mid2}" data-row="${i - 1}" data-side="mid2">
-          </div>
-          <div>
-            <div class="seat-input-label">Right</div>
-            <input class="seat-input" type="number" min="0" max="12" value="${cfg.right}" data-row="${i - 1}" data-side="right">
-          </div>`;
-        } else if (state.layoutType === "straight_hexa") {
-            gridHTML = `
-          <div>
-            <div class="seat-input-label">Left</div>
-            <input class="seat-input" type="number" min="0" max="12" value="${cfg.left}" data-row="${i - 1}" data-side="left">
-          </div>
-          <div>
-            <div class="seat-input-label">Mid 1</div>
-            <input class="seat-input" type="number" min="0" max="12" value="${cfg.mid1}" data-row="${i - 1}" data-side="mid1">
-          </div>
-          <div>
-            <div class="seat-input-label">Mid 2</div>
-            <input class="seat-input" type="number" min="0" max="12" value="${cfg.mid2}" data-row="${i - 1}" data-side="mid2">
-          </div>
-          <div>
-            <div class="seat-input-label">Mid 3</div>
-            <input class="seat-input" type="number" min="0" max="12" value="${cfg.mid3}" data-row="${i - 1}" data-side="mid3">
-          </div>
-          <div>
-            <div class="seat-input-label">Mid 4</div>
-            <input class="seat-input" type="number" min="0" max="12" value="${cfg.mid4}" data-row="${i - 1}" data-side="mid4">
-          </div>
-          <div>
-            <div class="seat-input-label">Right</div>
-            <input class="seat-input" type="number" min="0" max="12" value="${cfg.right}" data-row="${i - 1}" data-side="right">
-          </div>`;
-        } else if (state.layoutType === "straight_penta") {
-            gridHTML = `
-          <div>
-            <div class="seat-input-label">Left</div>
-            <input class="seat-input" type="number" min="0" max="12" value="${cfg.left}" data-row="${i - 1}" data-side="left">
-          </div>
-          <div>
-            <div class="seat-input-label">Mid 1</div>
-            <input class="seat-input" type="number" min="0" max="12" value="${cfg.mid1}" data-row="${i - 1}" data-side="mid1">
-          </div>
-          <div>
-            <div class="seat-input-label">Mid 2</div>
-            <input class="seat-input" type="number" min="0" max="12" value="${cfg.mid2}" data-row="${i - 1}" data-side="mid2">
-          </div>
-          <div>
-            <div class="seat-input-label">Mid 3</div>
-            <input class="seat-input" type="number" min="0" max="12" value="${cfg.mid3}" data-row="${i - 1}" data-side="mid3">
-          </div>
-          <div>
-            <div class="seat-input-label">Right</div>
-            <input class="seat-input" type="number" min="0" max="12" value="${cfg.right}" data-row="${i - 1}" data-side="right">
-          </div>`;
-        } else {
-            gridHTML = `
-          <div>
-            <div class="seat-input-label">Left</div>
-            <input class="seat-input" type="number" min="0" max="12" value="${cfg.left}" data-row="${i - 1}" data-side="left">
-          </div>
-          <div>
-            <div class="seat-input-label">Middle</div>
-            <input class="seat-input" type="number" min="0" max="12" value="${cfg.middle}" data-row="${i - 1}" data-side="middle">
-          </div>
-          <div>
-            <div class="seat-input-label">Right</div>
-            <input class="seat-input" type="number" min="0" max="12" value="${cfg.right}" data-row="${i - 1}" data-side="right">
-          </div>`;
-        }
-
-        item.innerHTML = `
-      <div class="row-config-header" data-idx="${i - 1}">
-        <span>Row ${i}</span>
-        <span style="font-size:11px;color:var(--gray-400)">${state.layoutType === 'straight_quad' ? `L:${cfg.left} M1:${cfg.mid1} M2:${cfg.mid2} R:${cfg.right}` : (state.layoutType === 'straight_penta' ? `L:${cfg.left} M1:${cfg.mid1} M2:${cfg.mid2} M3:${cfg.mid3} R:${cfg.right}` : (state.layoutType === 'straight_hexa' ? `L:${cfg.left} M1:${cfg.mid1} M2:${cfg.mid2} M3:${cfg.mid3} M4:${cfg.mid4} R:${cfg.right}` : `L:${cfg.left} M:${cfg.middle} R:${cfg.right}`))} ▸</span>
-      </div>
-      <div class="row-config-body" id="rowBody${i}">
-        <div class="seats-grid">
-          ${gridHTML}
-        </div>
-      </div>`;
-        container.appendChild(item);
+function pick(row, names, fallback = "") {
+    for (const n of names) {
+        if (row[n] !== undefined && row[n] !== null && String(row[n]).trim() !== "") return row[n];
     }
+    // tolerate stray spaces / case differences in the header cell
+    const wanted = names.map(squash);
+    for (const key of Object.keys(row)) {
+        if (wanted.includes(squash(key)) && String(row[key]).trim() !== "") return row[key];
+    }
+    return fallback;
+}
 
-    // Toggle expand
-    container.querySelectorAll(".row-config-header").forEach((h) => {
-        h.addEventListener("click", () => {
-            const idx = h.getAttribute("data-idx");
-            const body = document.getElementById("rowBody" + (parseInt(idx) + 1));
-            body.classList.toggle("open");
-        });
-    });
+function setStatus(msg, isError = false) {
+    const el = $("statusLine");
+    if (!el) return;
+    el.textContent = msg || "";
+    el.classList.toggle("is-error", !!isError);
+}
 
-    // Seat count inputs
-    container.querySelectorAll(".seat-input").forEach((inp) => {
-        inp.addEventListener("change", () => {
-            const row = parseInt(inp.getAttribute("data-row"));
-            const side = inp.getAttribute("data-side");
-            const val = Math.max(0, Math.min(12, parseInt(inp.value) || 0));
-            inp.value = val;
-            state.rowConfigs[row][side] = val;
-            // Update header summary
-            const cfg = state.rowConfigs[row];
-            const header = container.querySelector(`.row-config-header[data-idx="${row}"] span:last-child`);
-            if (header) {
-                if (state.layoutType === 'straight_quad') {
-                    header.textContent = `L:${cfg.left} M1:${cfg.mid1} M2:${cfg.mid2} R:${cfg.right} ▸`;
-                } else if (state.layoutType === 'straight_penta') {
-                    header.textContent = `L:${cfg.left} M1:${cfg.mid1} M2:${cfg.mid2} M3:${cfg.mid3} R:${cfg.right} ▸`;
-                } else if (state.layoutType === 'straight_hexa') {
-                    header.textContent = `L:${cfg.left} M1:${cfg.mid1} M2:${cfg.mid2} M3:${cfg.mid3} M4:${cfg.mid4} R:${cfg.right} ▸`;
-                } else {
-                    header.textContent = `L:${cfg.left} M:${cfg.middle} R:${cfg.right} ▸`;
-                }
-            }
-        });
+function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) =>
+        ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+/* ─── Date handling ──────────────────────────────────────────────── */
+function parseExamDate(val) {
+    if (!val) return null;
+    if (val instanceof Date && !isNaN(val)) return val;
+
+    const s = String(val).trim().replace(/^[A-Za-z]+,\s*/, "");   // drop weekday
+    let m = s.match(/^(\d{1,2})[\s,]+([A-Za-z]+)[\s,]+(\d{4})$/); // 25 November, 2025
+    if (m) {
+        const mo = MONTHS[m[2].toLowerCase()];
+        if (mo !== undefined) return new Date(+m[3], mo, +m[1]);
+    }
+    m = s.match(/^([A-Za-z]+)[\s,]+(\d{1,2})[\s,]+(\d{4})$/);     // November 25, 2025
+    if (m) {
+        const mo = MONTHS[m[1].toLowerCase()];
+        if (mo !== undefined) return new Date(+m[3], mo, +m[2]);
+    }
+    m = s.match(/^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})$/);     // 25-11-2025
+    if (m) {
+        const yr = +m[3] < 100 ? 2000 + +m[3] : +m[3];
+        return new Date(yr, +m[2] - 1, +m[1]);
+    }
+    const d = new Date(s);
+    return isNaN(d) ? null : d;
+}
+
+/* Local-date key. toISOString() would shift the day for anyone east or
+   west of UTC (IST is +05:30), so the key is built from local parts. */
+function dateKeyOf(dateObj) {
+    const pad = (n) => String(n).padStart(2, "0");
+    return dateObj.getFullYear() + "-" + pad(dateObj.getMonth() + 1) + "-" + pad(dateObj.getDate());
+}
+
+const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+/* The weekday printed on the report is the one written in the seating
+   plan file, never a recomputed one — the file is the official document.
+   If the two disagree, say so instead of quietly changing it. */
+function formatDateLong(dateObj, raw) {
+    const str = String(raw || "").trim();
+    if (/^[A-Za-z]{3,9}\s*,/.test(str)) {
+        return str.replace(/\s*,\s*/g, ", ").replace(/,\s*(\d{4})$/, " $1");
+    }
+    if (!dateObj) return str || "—";
+    return dateObj.toLocaleDateString("en-GB", {
+        weekday: "long", day: "2-digit", month: "long", year: "numeric"
     });
 }
 
-/**
- * Updates the existing Row Config UI elements without rebuilding the entire list.
- * This ensures state.rowConfigs values are synced to the inputs and headers.
- */
-function updateRowConfigUI() {
-    const container = document.getElementById("rowConfigsList");
-    if (!container) return;
-
-    state.rowConfigs.forEach((cfg, i) => {
-        // Update header summary
-        const header = container.querySelector(`.row-config-header[data-idx="${i}"] span:last-child`);
-        if (header) {
-            if (state.layoutType === 'straight_quad') {
-                header.textContent = `L:${cfg.left} M1:${cfg.mid1} M2:${cfg.mid2} R:${cfg.right} ▸`;
-            } else if (state.layoutType === 'straight_penta') {
-                header.textContent = `L:${cfg.left} M1:${cfg.mid1} M2:${cfg.mid2} M3:${cfg.mid3} R:${cfg.right} ▸`;
-            } else if (state.layoutType === 'straight_hexa') {
-                header.textContent = `L:${cfg.left} M1:${cfg.mid1} M2:${cfg.mid2} M3:${cfg.mid3} M4:${cfg.mid4} R:${cfg.right} ▸`;
-            } else {
-                header.textContent = `L:${cfg.left} M:${cfg.middle} R:${cfg.right} ▸`;
-            }
-        }
-
-        // Update inputs
-        const inputs = container.querySelectorAll(`.seat-input[data-row="${i}"]`);
-        inputs.forEach(inp => {
-            const side = inp.getAttribute("data-side");
-            if (cfg[side] !== undefined) {
-                inp.value = cfg[side];
-            }
-        });
-    });
+/* Returns the weekday named in the raw value, when it names one. */
+function statedWeekday(raw) {
+    const m = String(raw || "").trim().match(/^([A-Za-z]{3,9})\s*,/);
+    if (!m) return null;
+    const name = m[1].toLowerCase();
+    const hit = WEEKDAYS.find((w) => w.toLowerCase().startsWith(name.slice(0, 3)));
+    return hit || null;
 }
 
-// ─── Upload Cards ─────────────────────────────────────────────────────
+function formatDateShort(dateObj, raw) {
+    if (!dateObj) return String(raw || "—").trim() || "—";
+    return dateObj.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
+}
+
+function normalizeTime(val) {
+    if (val instanceof Date && !isNaN(val)) {
+        return val.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+    }
+    return String(val || "").trim().replace(/\s*-\s*/g, " – ").replace(/\s+/g, " ") || "—";
+}
+
+function formatSemester(val) {
+    const s = String(val || "").trim();
+    if (!s) return "—";
+    const cleaned = s.replace(/^semester\s*/i, "").replace(/^sem\.?\s*/i, "").trim();
+    return cleaned ? "Semester " + cleaned : s;
+}
+
+/* ─── Upload handling ────────────────────────────────────────────── */
 function bindUploadCards() {
     bindOneUpload("rollUpload", "rollCard", "rollFilename", (file) => {
         state.rollFile = file;
-        parseExcel(file, (data) => { state.rollData = data; });
+        parseExcel(file, (data) => {
+            state.rollData = data;
+            setStatus(`Roll list loaded — ${data.length} rows.`);
+            maybeAutoGenerate();
+        });
     });
     bindOneUpload("metaUpload", "metaCard", "metaFilename", (file) => {
         state.metaFile = file;
         parseExcel(file, (data) => {
             state.metaData = data;
-            populateRooms(data);
+            setStatus(`Seating plan loaded — ${data.length} allocations.`);
+            maybeAutoGenerate();
         });
     });
 }
 
 function bindOneUpload(inputId, cardId, filenameId, callback) {
-    const input = document.getElementById(inputId);
-    const card = document.getElementById(cardId);
-    const filenameEl = document.getElementById(filenameId);
+    const input = $(inputId);
+    const card = $(cardId);
+    const filenameEl = $(filenameId);
+    if (!input || !card) return;
 
-    input.addEventListener("change", (e) => {
-        const file = e.target.files[0];
+    const accept = (file) => {
         if (!file) return;
         card.classList.add("uploaded");
         filenameEl.textContent = file.name;
-        card.querySelector(".upload-icon").textContent = "✅";
         callback(file);
-    });
+    };
 
+    input.addEventListener("change", (e) => accept(e.target.files[0]));
     card.addEventListener("dragover", (e) => { e.preventDefault(); card.classList.add("drag-over"); });
     card.addEventListener("dragleave", () => card.classList.remove("drag-over"));
     card.addEventListener("drop", (e) => {
         e.preventDefault();
         card.classList.remove("drag-over");
-        const file = e.dataTransfer.files[0];
-        if (!file) return;
-        card.classList.add("uploaded");
-        filenameEl.textContent = file.name;
-        card.querySelector(".upload-icon").textContent = "✅";
-        callback(file);
+        accept(e.dataTransfer.files[0]);
     });
 }
 
-// ─── Parse Excel ──────────────────────────────────────────────────────
-function parseExcel(file, callback) {
-    if (!window.XLSX) {
-        alert("SheetJS is still loading. Please try again in a moment.");
-        return;
+/* ═══════════════════════════════════════════════════════════════════
+   Built-in .xlsx reader
+   -------------------------------------------------------------------
+   An .xlsx file is a ZIP of XML parts. Reading it here — rather than
+   fetching a library from a CDN — means the portal keeps working with
+   no internet connection and behind the campus firewall.
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* ZIP: read the central directory, then each entry's data. */
+async function unzip(buffer) {
+    const view = new DataView(buffer);
+    const bytes = new Uint8Array(buffer);
+
+    // End of central directory record, scanning back over the comment
+    let eocd = -1;
+    for (let i = bytes.length - 22; i >= Math.max(0, bytes.length - 66000); i--) {
+        if (view.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
     }
-    const reader = new FileReader();
-    reader.onload = (e) => {
-        try {
-            const wb = XLSX.read(e.target.result, { type: "binary", cellDates: true });
-            const ws = wb.Sheets[wb.SheetNames[0]];
-            const data = XLSX.utils.sheet_to_json(ws, { defval: "" });
-            callback(data);
-        } catch (err) {
-            alert("Error reading Excel file: " + err.message);
-        }
-    };
-    reader.readAsBinaryString(file);
+    if (eocd < 0) throw new Error("not a valid .xlsx file (no ZIP directory)");
+
+    const count = view.getUint16(eocd + 10, true);
+    let ptr = view.getUint32(eocd + 16, true);
+
+    const files = new Map();
+    for (let i = 0; i < count; i++) {
+        if (view.getUint32(ptr, true) !== 0x02014b50) break;
+        const method = view.getUint16(ptr + 10, true);
+        const compSize = view.getUint32(ptr + 20, true);
+        const nameLen = view.getUint16(ptr + 28, true);
+        const extraLen = view.getUint16(ptr + 30, true);
+        const commentLen = view.getUint16(ptr + 32, true);
+        const localOff = view.getUint32(ptr + 42, true);
+        const name = new TextDecoder().decode(bytes.subarray(ptr + 46, ptr + 46 + nameLen));
+
+        // local header tells us where the data actually starts
+        const lNameLen = view.getUint16(localOff + 26, true);
+        const lExtraLen = view.getUint16(localOff + 28, true);
+        const dataStart = localOff + 30 + lNameLen + lExtraLen;
+
+        files.set(name, { method, data: bytes.subarray(dataStart, dataStart + compSize) });
+        ptr += 46 + nameLen + extraLen + commentLen;
+    }
+    return files;
 }
 
-// ─── Populate Room selector ───────────────────────────────────────────
-function populateRooms(data) {
-    const metaRooms = [...new Set(data.map((r) => r["Room No."]).filter(Boolean))];
-    const combinedRooms = [...new Set([...DEFAULT_ROOMS, ...metaRooms])].sort();
-    state.rooms = combinedRooms;
-
-    const sel = document.getElementById("roomSelect");
-    sel.innerHTML = combinedRooms.map((r) => `<option value="${r}" ${r === state.selectedRoom ? "selected" : ""}>${r}</option>`).join("");
-    sel.disabled = false;
+async function inflateRaw(bytes) {
+    const stream = new Blob([bytes]).stream()
+        .pipeThrough(new DecompressionStream("deflate-raw"));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
-function applyRoomDefaults(roomName) {
-    const defaults = ROOM_DEFAULTS[roomName];
-    if (defaults) {
-        state.layoutType = defaults.layoutType || "auditorium";
-        state.alternateSeating = !!defaults.alternateSeating;
+async function zipText(files, name) {
+    const entry = files.get(name);
+    if (!entry) return null;
+    const raw = entry.method === 0 ? entry.data : await inflateRaw(entry.data);
+    return new TextDecoder().decode(raw);
+}
 
-        // Update Sidebar UI
-        const layoutSelect = document.getElementById("layoutType");
-        const rowCountInput = document.getElementById("totalRows");
-        if (layoutSelect) layoutSelect.value = state.layoutType;
-        if (rowCountInput) rowCountInput.value = defaults.totalRows || 6;
+function parseXml(text) {
+    const doc = new DOMParser().parseFromString(text, "application/xml");
+    if (doc.querySelector("parsererror")) throw new Error("the file's XML could not be read");
+    return doc;
+}
 
-        // Rebuild configurations with new row count
-        // NOTE: This call populates state.rowConfigs with basic values based on layoutType
-        buildRowConfigs(defaults.totalRows || 6);
+/* "BC7" -> column 54 (zero-based) */
+function colOf(ref) {
+    let n = 0;
+    for (const ch of ref) {
+        const c = ch.charCodeAt(0);
+        if (c < 65 || c > 90) break;
+        n = n * 26 + (c - 64);
+    }
+    return n - 1;
+}
 
-        // Apply specific seat counts if provided
-        if (defaults.rowConfigs) {
-            if (Array.isArray(defaults.rowConfigs)) {
-                // Apply per-row config
-                defaults.rowConfigs.forEach((cfg, i) => {
-                    if (state.rowConfigs[i]) {
-                        state.rowConfigs[i].left = cfg.left;
-                        if (state.layoutType === "straight_quad") {
-                            state.rowConfigs[i].mid1 = cfg.mid1;
-                            state.rowConfigs[i].mid2 = cfg.mid2;
-                        } else if (state.layoutType === "straight_penta") {
-                            state.rowConfigs[i].mid1 = cfg.mid1;
-                            state.rowConfigs[i].mid2 = cfg.mid2;
-                            state.rowConfigs[i].mid3 = cfg.mid3;
-                        } else if (state.layoutType === "straight_hexa") {
-                            state.rowConfigs[i].mid1 = cfg.mid1;
-                            state.rowConfigs[i].mid2 = cfg.mid2;
-                            state.rowConfigs[i].mid3 = cfg.mid3;
-                            state.rowConfigs[i].mid4 = cfg.mid4;
-                        } else {
-                            state.rowConfigs[i].middle = cfg.middle;
-                        }
-                        state.rowConfigs[i].right = cfg.right;
-                    }
-                });
+/* Excel serial -> Date (epoch 1899-12-30 absorbs the 1900 leap-year bug) */
+function excelDate(serial) {
+    const ms = Math.round(serial * 86400000);
+    return new Date(Date.UTC(1899, 11, 30) + ms);
+}
+
+const BUILTIN_DATE_FMTS = new Set([14, 15, 16, 17, 18, 19, 20, 21, 22, 45, 46, 47]);
+
+/* Which style indexes format their number as a date */
+function dateStyles(stylesXml) {
+    const set = new Set();
+    if (!stylesXml) return set;
+    let doc;
+    try { doc = parseXml(stylesXml); } catch (e) { return set; }
+
+    const custom = new Map();
+    doc.querySelectorAll("numFmts > numFmt").forEach((f) => {
+        const id = parseInt(f.getAttribute("numFmtId"), 10);
+        const code = (f.getAttribute("formatCode") || "").replace(/\[[^\]]*\]/g, "").replace(/"[^"]*"/g, "");
+        if (/[dmyhs]/i.test(code) && /[dy]/i.test(code)) custom.set(id, true);
+    });
+
+    const xfs = doc.querySelector("cellXfs");
+    if (!xfs) return set;
+    Array.from(xfs.children).forEach((xf, i) => {
+        const id = parseInt(xf.getAttribute("numFmtId") || "0", 10);
+        if (BUILTIN_DATE_FMTS.has(id) || custom.get(id)) set.add(i);
+    });
+    return set;
+}
+
+/* Reads the first worksheet into the same shape SheetJS produced:
+   an array of objects keyed by the header row, blanks as "". */
+async function readXlsx(buffer) {
+    const files = await unzip(buffer);
+
+    const wbXml = await zipText(files, "xl/workbook.xml");
+    if (!wbXml) throw new Error("this is not an .xlsx workbook");
+
+    // first sheet, resolved through the relationship id
+    const wb = parseXml(wbXml);
+    const sheet = wb.querySelector("sheets > sheet");
+    if (!sheet) throw new Error("the workbook has no sheets");
+    const rid = sheet.getAttribute("r:id") || sheet.getAttribute("id");
+
+    let target = null;
+    const relsXml = await zipText(files, "xl/_rels/workbook.xml.rels");
+    if (relsXml && rid) {
+        const rel = Array.from(parseXml(relsXml).querySelectorAll("Relationship"))
+            .find((r) => r.getAttribute("Id") === rid);
+        if (rel) target = rel.getAttribute("Target");
+    }
+    let path = target ? (target.startsWith("/") ? target.slice(1)
+        : target.startsWith("xl/") ? target : "xl/" + target)
+        : "xl/worksheets/sheet1.xml";
+    if (!files.has(path)) path = "xl/worksheets/sheet1.xml";
+
+    const sheetXml = await zipText(files, path);
+    if (!sheetXml) throw new Error("the first worksheet could not be found");
+
+    // shared strings
+    const shared = [];
+    const sstXml = await zipText(files, "xl/sharedStrings.xml");
+    if (sstXml) {
+        parseXml(sstXml).querySelectorAll("sst > si").forEach((si) => {
+            const t = si.querySelector(":scope > t");
+            if (t) { shared.push(t.textContent); return; }
+            let out = "";
+            si.querySelectorAll("r > t").forEach((x) => { out += x.textContent; });
+            shared.push(out);
+        });
+    }
+
+    const dateFmt = dateStyles(await zipText(files, "xl/styles.xml"));
+
+    // cells -> a grid
+    const grid = [];
+    parseXml(sheetXml).querySelectorAll("sheetData > row").forEach((row) => {
+        const rowIdx = parseInt(row.getAttribute("r"), 10) - 1;
+        const cells = [];
+        let auto = 0;
+        row.querySelectorAll("c").forEach((c) => {
+            const ref = c.getAttribute("r");
+            const ci = ref ? colOf(ref) : auto;
+            auto = ci + 1;
+
+            const type = c.getAttribute("t");
+            let value = "";
+            if (type === "inlineStr") {
+                const t = c.querySelector("is t");
+                value = t ? t.textContent : "";
             } else {
-                // Apply uniform config to all rows
-                state.rowConfigs.forEach((cfg) => {
-                    cfg.left = defaults.rowConfigs.left;
-                    if (state.layoutType === "straight_quad") {
-                        cfg.mid1 = defaults.rowConfigs.mid1;
-                        cfg.mid2 = defaults.rowConfigs.mid2;
-                    } else if (state.layoutType === "straight_penta") {
-                        cfg.mid1 = defaults.rowConfigs.mid1;
-                        cfg.mid2 = defaults.rowConfigs.mid2;
-                        cfg.mid3 = defaults.rowConfigs.mid3;
-                    } else if (state.layoutType === "straight_hexa") {
-                        cfg.mid1 = defaults.rowConfigs.mid1;
-                        cfg.mid2 = defaults.rowConfigs.mid2;
-                        cfg.mid3 = defaults.rowConfigs.mid3;
-                        cfg.mid4 = defaults.rowConfigs.mid4;
-                    } else {
-                        cfg.middle = defaults.rowConfigs.middle;
-                    }
-                    cfg.right = defaults.rowConfigs.right;
-                });
-            }
-
-            // Update the UI HTML only, without overwriting state.rowConfigs again
-            updateRowConfigUI();
-        }
-    } else {
-        // Optional: Reset to standard defaults if room not in ROOM_DEFAULTS
-        state.alternateSeating = false;
-    }
-}
-
-// ─── Generate Button ──────────────────────────────────────────────────
-function bindGenerateBtn() {
-    document.getElementById("generateBtn").addEventListener("click", () => {
-        // We now allow generation even without files for "Layout Preview" mode
-        if (!state.selectedRoom) {
-            alert("Please select a room.");
-            return;
-        }
-        generateReport();
-    });
-}
-
-// ─── Utilities ────────────────────────────────────────────────────────
-function parseRollRange(rangeStr) {
-    const results = [];
-    try {
-        const str = String(rangeStr);
-        const parts = str.split(",").map(p => p.trim()).filter(Boolean);
-
-        for (const part of parts) {
-            const segments = part.split("-");
-            if (segments.length >= 2) {
-                const prefixMatch = segments[0].match(/[A-Za-z]+/);
-                const startMatch = segments[0].match(/\d+/);
-                const endMatch = segments[1].match(/\d+/);
-                if (prefixMatch && startMatch && endMatch) {
-                    results.push({
-                        prefix: prefixMatch[0],
-                        start: parseInt(startMatch[0]),
-                        end: parseInt(endMatch[0]),
-                    });
+                const v = c.querySelector("v");
+                const raw = v ? v.textContent : "";
+                if (raw === "") value = "";
+                else if (type === "s") value = shared[parseInt(raw, 10)] ?? "";
+                else if (type === "str") value = raw;
+                else if (type === "b") value = raw === "1";
+                else if (type === "e") value = "";
+                else {
+                    const num = parseFloat(raw);
+                    const st = parseInt(c.getAttribute("s") || "-1", 10);
+                    value = (!isNaN(num) && dateFmt.has(st)) ? excelDate(num)
+                        : (isNaN(num) ? raw : num);
                 }
             }
-        }
-    } catch (e) { /* ignore */ }
-    return results.length > 0 ? results : null;
-}
-
-function extractNum(val) {
-    const m = String(val).match(/\d+/);
-    return m ? parseInt(m[0]) : NaN;
-}
-
-/**
- * Normalizes a string by:
- * 1. Trimming whitespace
- * 2. Lowercasing
- * 3. Collapsing multiple whitespaces/newlines into a single space
- */
-function normalizeStr(s) {
-    if (!s) return "";
-    return String(s)
-        .trim()
-        .toLowerCase()
-        .replace(/\s+/g, " ");
-}
-
-function formatDate(val) {
-    if (!val) return "—";
-    if (val instanceof Date) {
-        return val.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
-    }
-    const s = String(val).trim();
-    // Handle "Monday, 1 December, 2025" or similar long formats
-    const cleanDate = s.replace(/^[A-Za-z]+,\s*/, ""); // remove "Monday, "
-    return cleanDate || s || "—";
-}
-
-// ─── Core: Generate Report ────────────────────────────────────────────
-// ─── Core: Generate Report ────────────────────────────────────────────
-// ─── Core: Generate Report (UPDATED - uses comma instead of &) ─────────────
-function generateReport() {
-    const room = state.selectedRoom;
-    if (!room) {
-        alert("Please select a room first.");
-        return;
-    }
-
-    const normalizedRoom = normalizeStr(room);
-
-    const metaRows = (state.metaData || []).filter((r) => {
-        let excelRoom = r["Room No."] || r["Room"] || r["RoomNo"] || r["Room Number"] || "";
-        excelRoom = normalizeStr(excelRoom);
-        return excelRoom === normalizedRoom ||
-               excelRoom.includes(normalizedRoom) ||
-               normalizedRoom.includes(excelRoom) ||
-               excelRoom.replace(/[\s.-]/g, '') === normalizedRoom.replace(/[\s.-]/g, '');
+            cells[ci] = value;
+        });
+        grid[isNaN(rowIdx) ? grid.length : rowIdx] = cells;
     });
 
-    if (metaRows.length === 0) {
-        console.log("Available rooms:", [...new Set((state.metaData || []).map(r => r["Room No."] || r["Room"]))]);
-        alert(`No data found for room: ${room}`);
+    // first non-empty row is the header
+    const notEmpty = (r) => r && r.some((v) => v !== undefined && v !== "" && v !== null);
+    const headerIdx = grid.findIndex(notEmpty);
+    if (headerIdx < 0) return [];
+
+    const seen = new Map();
+    const header = (grid[headerIdx] || []).map((h, i) => {
+        let name = (h === undefined || h === null || h === "") ? "__EMPTY" + (i ? "_" + i : "") : String(h);
+        if (seen.has(name)) {
+            const n = seen.get(name) + 1;
+            seen.set(name, n);
+            name = name + "_" + n;
+        } else seen.set(name, 0);
+        return name;
+    });
+
+    const out = [];
+    for (let r = headerIdx + 1; r < grid.length; r++) {
+        const row = grid[r];
+        if (!notEmpty(row)) continue;
+        const obj = {};
+        header.forEach((key, i) => {
+            const v = row[i];
+            obj[key] = (v === undefined || v === null) ? "" : v;
+        });
+        out.push(obj);
+    }
+    return out;
+}
+
+/* Reads the workbook, preferring the built-in reader. */
+function parseExcel(file, callback) {
+    const name = (file.name || "").toLowerCase();
+    if (name.endsWith(".xls")) {
+        setStatus("This is an old .xls file. Open it in Excel and use "
+            + "Save As → Excel Workbook (.xlsx), then upload again.", true);
         return;
     }
 
-    // ─── MULTI-PROGRAMME SUPPORT ─────────────────────────────────────
-    const programmesSet = new Set();
-    const subjectsSet = new Set();
-    const rollRangesSet = new Set();
-
-    const allStudents = [];
-
-    for (const row of metaRows) {
-        const prog = row["Prog. Name & Stream"] || row["Programme"] || row["Prog Name"] || "";
-        if (prog) programmesSet.add(prog);
-
-        const subj = row["Subject"] || row["Subjects"] || "";
-        if (subj) subjectsSet.add(subj);
-
-        const range = row["Roll No. Range"] || row["Roll No.Range"] || row["Roll Range"] || row["Roll_No._Range"] || row["Roll No."] || "";
-        if (range) rollRangesSet.add(range);
-
-        const ranges = parseRollRange(range);
-        if (ranges) {
-            for (const r of ranges) {
-                const valid = (state.rollData || []).filter((student) => {
-                    const rollStr = String(student["Roll Number"] || student["Roll No."] || "").trim();
-                    const num = extractNum(rollStr);
-                    const prefix = (rollStr.match(/[A-Za-z]+/) || [""])[0];
-                    return !isNaN(num) && num >= r.start && num <= r.end &&
-                           normalizeStr(prefix) === normalizeStr(r.prefix);
-                });
-
-                valid.forEach((s) => {
-                    const rollVal = String(s["Roll Number"] || s["Roll No."] || "").trim();
-                    if (rollVal && !allStudents.includes(rollVal)) {
-                        allStudents.push(rollVal);
-                    }
-                });
+    const reader = new FileReader();
+    reader.onerror = () => setStatus("The file could not be read from disk.", true);
+    reader.onload = async (e) => {
+        try {
+            const rows = await readXlsx(e.target.result);
+            if (!rows.length) {
+                setStatus("No rows found in the first sheet of " + file.name + ".", true);
+                return;
             }
+            callback(rows);
+        } catch (err) {
+            // fall back to SheetJS if a copy happens to be available
+            if (window.XLSX) {
+                try {
+                    const wb = XLSX.read(new Uint8Array(e.target.result), { type: "array", cellDates: true });
+                    callback(XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: "" }));
+                    return;
+                } catch (e2) { /* fall through to the message below */ }
+            }
+            setStatus("Could not read " + file.name + ": " + err.message, true);
+        }
+    };
+    reader.readAsArrayBuffer(file);
+}
+
+/* Both files present -> build every report straight away. */
+function maybeAutoGenerate() {
+    const ready = state.rollData && state.metaData;
+    const btn = $("generateBtn");
+    if (btn) btn.disabled = !ready;
+    if (ready) generateAll();
+}
+
+function bindGenerateBtn() {
+    const btn = $("generateBtn");
+    if (!btn) return;
+    btn.disabled = true;
+    btn.addEventListener("click", () => {
+        if (!state.rollData || !state.metaData) {
+            setStatus("Please upload both the roll list and the seating plan.", true);
+            return;
+        }
+        generateAll();
+    });
+}
+
+/* ─── Roll number ranges ─────────────────────────────────────────── */
+function parseRollRange(rangeStr) {
+    const results = [];
+    const str = String(rangeStr || "");
+    for (const part of str.split(/[,;]/).map((p) => p.trim()).filter(Boolean)) {
+        const seg = part.split(/\s*[-–to]+\s*/i).filter(Boolean);
+        const a = seg[0] || "";
+        const b = seg.length > 1 ? seg[seg.length - 1] : a;
+        const prefix = (a.match(/[A-Za-z]+/) || [""])[0];
+        const start = extractNum(a);
+        const end = extractNum(b);
+        if (!isNaN(start) && !isNaN(end)) {
+            results.push({ prefix, start: Math.min(start, end), end: Math.max(start, end) });
         }
     }
+    return results;
+}
 
-    const info = {
-        room: room,
-        academicYear: metaRows[0]["Academic Year"] || "2025-2026",
-        examType: state.examType || "Final Exam",
-        date: formatDate(metaRows[0]["Exam Date"] || metaRows[0]["Date"]) || "—",
-        time: metaRows[0]["Exam Time"] || metaRows[0]["Time"] || "—",
-        programme: Array.from(programmesSet).join(", "),      // ← Changed to comma
-        subjects: Array.from(subjectsSet).join(", "),         // ← Changed to comma
-        sem: metaRows[0]["Semester"] || metaRows[0]["Sem"] || "I",
-        rollRange: Array.from(rollRangesSet).join(", "),      // ← Changed to comma
-        totalStudents: allStudents.length
+function rollInRanges(roll, ranges) {
+    const s = String(roll).trim();
+    const prefix = (s.match(/[A-Za-z]+/) || [""])[0];
+    const num = extractNum(s);
+    if (isNaN(num)) return false;
+    return ranges.some((r) =>
+        num >= r.start && num <= r.end && normalizeStr(prefix) === normalizeStr(r.prefix));
+}
+
+/* Students for one allocation row: match on range, then narrow by
+   subject and programme when the roll list carries those columns. */
+function studentsForAllocation(metaRow, ranges) {
+    const wantSubject = normalizeStr(pick(metaRow, ["Subject", "Subjects"]));
+    const wantProg = normalizeStr(pick(metaRow, ["Prog. Name & Stream", "Programme", "Prog Name", "Program"]));
+
+    const inRange = (state.rollData || []).filter((st) =>
+        rollInRanges(pick(st, ["Roll Number", "Roll No.", "Roll No", "RollNumber"]), ranges));
+
+    const narrow = (rows, key, want) => {
+        if (!want) return rows;
+        const hit = rows.filter((st) => normalizeStr(pick(st, key)) === want);
+        return hit.length ? hit : rows;      // ignore the filter if the column is absent/different
     };
 
-    state.layoutType = "auditorium";
+    let rows = narrow(inRange, ["SUBJECT", "Subject", "Subjects"], wantSubject);
+    rows = narrow(rows, ["Prog. Name & Stream", "Programme", "Prog Name", "Program"], wantProg);
 
-    let idx = 0;
-    const assignedRows = state.rowConfigs.map((cfg) => {
-        const rowData = { left: [], middle: [], right: [] };
-        const sides = ["left", "middle", "right"];
-        for (const side of sides) {
-            const seatCount = Number(cfg[side]) || 0;
-            for (let s = 0; s < seatCount; s++) {
-                rowData[side].push(idx < allStudents.length ? allStudents[idx++] : "");
-            }
-        }
-        return rowData;
+    const out = [];
+    const seen = new Set();
+    for (const st of rows) {
+        const roll = String(pick(st, ["Roll Number", "Roll No.", "Roll No", "RollNumber"])).trim();
+        if (roll && !seen.has(roll)) { seen.add(roll); out.push(roll); }
+    }
+    out.sort((a, b) => {
+        const pa = (a.match(/[A-Za-z]+/) || [""])[0], pb = (b.match(/[A-Za-z]+/) || [""])[0];
+        return pa === pb ? extractNum(a) - extractNum(b) : pa.localeCompare(pb);
     });
-
-    renderReport(info, assignedRows, allStudents);
+    return out;
 }
 
-// ─── Render Report ────────────────────────────────────────────────────
-function renderReport(info, assignedRows, allStudents) {
-    // Switch views
-    uploadView().style.display = "none";
-    reportView().style.display = "block";
-    reportView().classList.add("fade-up");
+/* ─── Room layout ────────────────────────────────────────────────── */
+function cloneRowConfigs(defaults, layoutType, totalRows) {
+    const sides = SIDE_ORDER[layoutType] || SIDE_ORDER.auditorium;
+    const blank = () => {
+        const c = {};
+        sides.forEach((s) => { c[s] = 0; });
+        return c;
+    };
+    const rows = [];
+    for (let i = 0; i < totalRows; i++) {
+        const cfg = blank();
+        let src = null;
+        if (Array.isArray(defaults)) src = defaults[i];
+        else if (defaults) src = defaults;                   // uniform config
+        if (src) sides.forEach((s) => { cfg[s] = Number(src[s]) || 0; });
+        rows.push(cfg);
+    }
+    return rows;
+}
 
-    const toolbarRoomSel = document.getElementById("toolbarRoomSelect");
-    toolbarRoomSel.innerHTML = state.rooms.map((r) =>
-        `<option value="${r}" ${r === info.room ? "selected" : ""}>${r}</option>`
-    ).join("");
+/* Rooms absent from ROOM_DEFAULTS get a sensible auditorium that fits. */
+function autoFitLayout(count) {
+    const perRow = 6;
+    const rows = Math.max(4, Math.min(25, Math.ceil((count || 1) / perRow)));
+    return {
+        layoutType: "auditorium",
+        totalRows: rows,
+        rowConfigs: Array.from({ length: rows }, () => ({ left: 3, middle: 0, right: 3 })),
+        alternateSeating: false,
+        isFallback: true
+    };
+}
 
-    // Remove existing listeners before adding new one to prevent multiple triggers
-    const newToolbarRoomSel = toolbarRoomSel.cloneNode(true);
-    toolbarRoomSel.parentNode.replaceChild(newToolbarRoomSel, toolbarRoomSel);
+function getRoomLayout(room, count) {
+    const override = state.overrides[room];
+    if (override) return JSON.parse(JSON.stringify(override));
 
-    newToolbarRoomSel.addEventListener("change", () => {
-        handleRoomChange(newToolbarRoomSel.value);
+    const d = ROOM_DEFAULTS[room];
+    if (!d) return autoFitLayout(count);
+
+    const layoutType = d.layoutType || "auditorium";
+    const totalRows = d.totalRows || 6;
+    return {
+        layoutType,
+        totalRows,
+        rowConfigs: cloneRowConfigs(d.rowConfigs, layoutType, totalRows),
+        alternateSeating: !!d.alternateSeating,
+        isFallback: false
+    };
+}
+
+function countSeats(layout) {
+    const sides = SIDE_ORDER[layout.layoutType] || SIDE_ORDER.auditorium;
+    return layout.rowConfigs.reduce((sum, cfg) =>
+        sum + sides.reduce((a, s) => a + (Number(cfg[s]) || 0), 0), 0);
+}
+
+/* A supervisor report must never drop a student. If the saved layout for
+   the room holds fewer seats than the students allotted to it, extend it
+   with extra rows (shaped like the widest existing row) and report it. */
+function fitLayoutToStudents(layout, count) {
+    const sides = SIDE_ORDER[layout.layoutType] || SIDE_ORDER.auditorium;
+    const rowSeats = (cfg) => sides.reduce((a, s) => a + (Number(cfg[s]) || 0), 0);
+
+    let seats = countSeats(layout);
+    if (count <= seats) return { added: 0, short: 0, seats };
+
+    // widest row is the best template for an extra row
+    const template = layout.rowConfigs.reduce(
+        (best, cfg) => (rowSeats(cfg) > rowSeats(best) ? cfg : best),
+        layout.rowConfigs[0] || {});
+    const perRow = rowSeats(template);
+    if (!perRow) return { added: 0, short: count - seats, seats };
+
+    let added = 0;
+    while (seats < count && layout.rowConfigs.length < 25) {
+        layout.rowConfigs.push(Object.assign({}, template));
+        seats += perRow;
+        added++;
+    }
+    layout.totalRows = layout.rowConfigs.length;
+    return { added, short: Math.max(0, count - seats), seats };
+}
+
+/* Interleave two or more programme cohorts so neighbours differ. */
+function interleaveCohorts(cohorts) {
+    const lists = cohorts.filter((c) => c.length);
+    if (lists.length < 2) return lists.flat();
+    const out = [];
+    for (let i = 0; out.length < lists.reduce((a, l) => a + l.length, 0); i++) {
+        for (const l of lists) if (i < l.length) out.push(l[i]);
+    }
+    return out;
+}
+
+/* Seat filling: row by row (R1 nearest the board), column by column. */
+function assignSeats(students, layout, startDirection) {
+    const sides = (SIDE_ORDER[layout.layoutType] || SIDE_ORDER.auditorium).slice();
+    if (startDirection === "right") sides.reverse();
+
+    let i = 0;
+    return layout.rowConfigs.map((cfg) => {
+        const row = {};
+        sides.forEach((side) => { row[side] = []; });
+        for (const side of sides) {
+            const n = Number(cfg[side]) || 0;
+            for (let s = 0; s < n; s++) row[side].push(i < students.length ? students[i++] : "");
+        }
+        if (startDirection === "right") sides.forEach((side) => row[side].reverse());
+        return row;
+    });
+}
+
+/* ─── Build every session ────────────────────────────────────────── */
+function generateAll() {
+    const meta = state.metaData || [];
+    if (!meta.length) {
+        setStatus("The seating plan file has no rows.", true);
+        return;
+    }
+
+    const groups = new Map();
+    let skipped = 0;
+
+    meta.forEach((row, idx) => {
+        const room = String(pick(row, ["Room No.", "Room", "RoomNo", "Room Number"])).trim();
+        if (!room) { skipped++; return; }
+
+        const dateRaw = pick(row, ["Exam Date", "Date"]);
+        const timeRaw = pick(row, ["Exam Time", "Time"]);
+        const dateObj = parseExamDate(dateRaw);
+        const time = normalizeTime(timeRaw);
+        const key = [squash(room), dateObj ? dateKeyOf(dateObj) : squash(dateRaw), squash(time)].join("|");
+
+        if (!groups.has(key)) {
+            groups.set(key, {
+                key, room, dateRaw, dateObj, time,
+                order: idx,
+                rows: []
+            });
+        }
+        groups.get(key).rows.push(row);
     });
 
-    // Stat bar
-    const getCnt = (v) => Array.isArray(v) ? v.filter(x => x === 1).length : (v || 0);
-    const totalSeats = state.rowConfigs.reduce((a, c) => {
-        if (state.layoutType === "straight_quad") {
-            return a + getCnt(c.left) + getCnt(c.mid1) + getCnt(c.mid2) + getCnt(c.right);
-        } else if (state.layoutType === "straight_penta") {
-            return a + getCnt(c.left) + getCnt(c.mid1) + getCnt(c.mid2) + getCnt(c.mid3) + getCnt(c.right);
-        } else if (state.layoutType === "straight_hexa") {
-            return a + getCnt(c.left) + getCnt(c.mid1) + getCnt(c.mid2) + getCnt(c.mid3) + getCnt(c.mid4) + getCnt(c.right);
+    const sessions = [];
+    for (const g of groups.values()) {
+        const programmes = [], subjects = [], ranges = [], sems = [], cohorts = [];
+        let stated = 0;
+
+        for (const row of g.rows) {
+            const prog = String(pick(row, ["Prog. Name & Stream", "Programme", "Prog Name", "Program"])).trim();
+            const subj = titleCaseSubject(pick(row, ["Subject", "Subjects"]));
+            const rangeStr = String(pick(row, ["Roll No. Range", "Roll No.Range", "Roll Range", "Roll No."])).trim();
+            const sem = formatSemester(pick(row, ["Semester", "Sem"]));
+            const cnt = parseInt(pick(row, ["Total Students Count", "Total Students", "Count"], 0), 10);
+
+            if (prog && !programmes.includes(prog)) programmes.push(prog);
+            if (subj && !subjects.includes(subj)) subjects.push(subj);
+            if (rangeStr && !ranges.includes(rangeStr)) ranges.push(rangeStr);
+            if (sem && sem !== "—" && !sems.includes(sem)) sems.push(sem);
+            if (!isNaN(cnt)) stated += cnt;
+
+            const parsed = parseRollRange(rangeStr);
+            cohorts.push(parsed.length ? studentsForAllocation(row, parsed) : []);
         }
-        return a + getCnt(c.left) + getCnt(c.middle) + getCnt(c.right);
-    }, 0);
 
-    document.getElementById("statTotal").textContent = info.totalStudents || info.total;
-    document.getElementById("statSeats").textContent = totalSeats;
-    document.getElementById("statRows").textContent = state.rowConfigs.length;
-    document.getElementById("statOccupancy").textContent =
-        totalSeats > 0 ? Math.round(((info.totalStudents || info.total) / totalSeats) * 100) + "%" : "—";
+        // de-duplicate across cohorts while keeping cohort structure
+        const seen = new Set();
+        const cleanCohorts = cohorts.map((c) => c.filter((r) => !seen.has(r) && seen.add(r)));
+        const students = state.interleaveBatches
+            ? interleaveCohorts(cleanCohorts)
+            : cleanCohorts.flat();
 
-    // ==================== YOUR REQUESTED HEADER INFORMATION ====================
-    document.getElementById("rptInstName").textContent = "SVKM'S NMIMS";
-    document.getElementById("rptRoom").textContent = "ROOM: " + (info.room || "—");
-    document.getElementById("rptAcYear").textContent = info.academicYear || "—";
-    document.getElementById("rptExamType").textContent = info.examType || "Final Exam";
-    document.getElementById("rptDate").textContent = info.date || "—";
-    document.getElementById("rptTime").textContent = info.time || "—";
-    document.getElementById("rptPrg").textContent = info.programme || "—";
-    document.getElementById("rptSubject").textContent = info.subjects || "—";
-    document.getElementById("rptSem").textContent = info.sem || "—";
-    document.getElementById("rptTotal").textContent = info.totalStudents || info.total || "—";
+        const layout = getRoomLayout(g.room, students.length);
+        const savedSeats = countSeats(layout);
+        const fit = fitLayoutToStudents(layout, students.length);
+        const seats = fit.seats;
 
-    // ==================== ROLL NO. RANGE (Safe Fix) ====================
-    const rollRangeEl = document.getElementById("rptRollRange");
-    if (rollRangeEl) {
-        rollRangeEl.textContent = info.rollRange || "—";
-    } else {
-        // Try to find any possible container and append if possible (safe fallback)
-        console.warn("Element with id 'rptRollRange' not found in HTML");
-        
-        // Optional: You can manually add it via JS as last resort
-        const headerContainer = document.querySelector('.header-info, #reportView, .report-header');
-        if (headerContainer && info.rollRange && info.rollRange !== "—") {
-            const rangeDiv = document.createElement('div');
-            rangeDiv.innerHTML = `<strong>Roll No. Range:</strong> ${info.rollRange}<br>`;
-            headerContainer.appendChild(rangeDiv);
+        const warnings = [], notes = [];
+        if (students.length === 0) {
+            warnings.push("No students matched the roll list for this allocation — check the roll number range.");
+        }
+        if (fit.short > 0) {
+            warnings.push(`${fit.short} student(s) could not be seated — this room needs a larger layout.`);
+        }
+        if (fit.added > 0) {
+            notes.push(`Saved layout holds ${savedSeats} seats for ${students.length} students; `
+                + `${fit.added} extra row(s) added so everyone is seated.`);
+        }
+        if (stated && stated !== students.length) {
+            notes.push(`Seating plan states ${stated} students; the roll list gives ${students.length}. `
+                + `The roll list has been used.`);
+        }
+        if (layout.isFallback) notes.push(`No saved layout for ${g.room} — a standard layout was applied.`);
+
+        const saidDay = statedWeekday(g.dateRaw);
+        if (saidDay && g.dateObj && saidDay !== WEEKDAYS[g.dateObj.getDay()]) {
+            notes.push(`The seating plan says "${saidDay}" for this date, but `
+                + `${formatDateShort(g.dateObj, g.dateRaw)} is a ${WEEKDAYS[g.dateObj.getDay()]}. `
+                + `The report prints the date exactly as given in the file — please confirm which is right.`);
+        }
+
+        sessions.push({
+            id: g.key,
+            room: g.room,
+            dateRaw: g.dateRaw,
+            dateObj: g.dateObj,
+            dateLong: formatDateLong(g.dateObj, g.dateRaw),
+            dateShort: formatDateShort(g.dateObj, g.dateRaw),
+            dateKey: g.dateObj ? dateKeyOf(g.dateObj) : squash(g.dateRaw),
+            time: g.time,
+            order: g.order,
+            programmes, subjects, rollRanges: ranges, sems,
+            academicYear: String(pick(g.rows[0], ["Academic Year", "AcademicYear"], "")).trim(),
+            students,
+            statedCount: stated,
+            layout, seats,
+            assigned: assignSeats(students, layout, state.startDirection),
+            warnings, notes
+        });
+    }
+
+    sessions.sort((a, b) => {
+        const da = a.dateObj ? a.dateObj.getTime() : Infinity;
+        const db = b.dateObj ? b.dateObj.getTime() : Infinity;
+        if (da !== db) return da - db;
+        if (a.time !== b.time) return a.time.localeCompare(b.time);
+        return a.room.localeCompare(b.room, undefined, { numeric: true });
+    });
+
+    state.sessions = sessions;
+    state.allRendered = false;
+    state.current = 0;
+    if (!state.academicYear) {
+        const ay = sessions.find((s) => s.academicYear);
+        state.academicYear = ay ? ay.academicYear : "2025-2026";
+        const ayInput = $("academicYear");
+        if (ayInput) ayInput.value = state.academicYear;
+    }
+
+    if (!sessions.length) {
+        setStatus("No exam sessions could be built from the seating plan.", true);
+        return;
+    }
+
+    buildDateFilter();
+    buildRoomFilter();
+    const dSel = $("dateFilter"), rSel = $("roomFilter");
+    if (dSel) dSel.value = "all";
+    if (rSel) rSel.value = "all";
+    applyFilter();
+    openReportView();
+
+    const flagged = sessions.filter((s) => s.warnings.length).length;
+    const noted = sessions.filter((s) => !s.warnings.length && s.notes.length).length;
+    setStatus(`${sessions.length} reports generated across `
+        + `${new Set(sessions.map((s) => s.dateKey)).size} exam dates.`
+        + (flagged ? ` ${flagged} need attention.` : "")
+        + (noted ? ` ${noted} carry a note.` : "")
+        + (skipped ? ` ${skipped} row(s) had no room number.` : ""));
+}
+
+/* ─── Session navigation ─────────────────────────────────────────── */
+function buildDateFilter() {
+    const sel = $("dateFilter");
+    if (!sel) return;
+    const dates = [];
+    for (const s of state.sessions) {
+        if (!dates.some((d) => d.key === s.dateKey)) {
+            dates.push({ key: s.dateKey, label: s.dateShort, time: s.time });
         }
     }
+    sel.innerHTML = `<option value="all">All dates (${state.sessions.length} reports)</option>`
+        + dates.map((d) => {
+            const n = state.sessions.filter((s) => s.dateKey === d.key).length;
+            return `<option value="${escapeHtml(d.key)}">${escapeHtml(d.label)} — ${n} room${n > 1 ? "s" : ""}</option>`;
+        }).join("");
+}
 
-    // Seating grid (your original code - unchanged)
-    const seatingGrid = document.getElementById("seatingGrid");
-    seatingGrid.innerHTML = "";
+function buildRoomFilter() {
+    const sel = $("roomFilter");
+    if (!sel) return;
+    const rooms = [...new Set(state.sessions.map((s) => s.room))]
+        .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
 
-    if (state.layoutType === "straight_quad") {
-        seatingGrid.classList.add("lab-layout", "quad-layout");
-        seatingGrid.classList.remove("hexa-layout", "penta-layout");
-    } else if (state.layoutType === "straight_penta") {
-        seatingGrid.classList.add("lab-layout", "penta-layout");
-        seatingGrid.classList.remove("quad-layout", "hexa-layout");
-    } else if (state.layoutType === "straight_hexa") {
-        seatingGrid.classList.add("lab-layout", "hexa-layout");
-        seatingGrid.classList.remove("quad-layout", "penta-layout");
-    } else if (state.layoutType === "lab" || state.layoutType === "straight_2_2_2") {
-        seatingGrid.classList.add("lab-layout");
-        seatingGrid.classList.remove("quad-layout", "hexa-layout", "penta-layout");
-    } else {
-        seatingGrid.classList.remove("lab-layout", "quad-layout", "hexa-layout", "penta-layout");
+    sel.innerHTML = `<option value="all">All rooms (${rooms.length})</option>`
+        + rooms.map((r) => {
+            const n = state.sessions.filter((s) => s.room === r).length;
+            return `<option value="${escapeHtml(r)}">${escapeHtml(r)} — ${n} report${n > 1 ? "s" : ""}</option>`;
+        }).join("");
+}
+
+/* Date and room filters are independent; either may be "all". */
+function applyFilter() {
+    const dateKey = ($("dateFilter") || {}).value || "all";
+    const room = ($("roomFilter") || {}).value || "all";
+
+    state.view = state.sessions
+        .map((s, i) => ({ s, i }))
+        .filter(({ s }) => (dateKey === "all" || s.dateKey === dateKey)
+                        && (room === "all" || s.room === room))
+        .map(({ i }) => i);
+
+    if (!state.view.length) {          // that room is not used on that date
+        showNoMatch(room, dateKey);
+        return;
     }
+    if (!state.view.includes(state.current)) state.current = state.view[0];
 
-    // Seating plan title adjustment
-    const planTitle = document.querySelector(".seating-plan-title");
-    if (planTitle) {
-        if (state.layoutType === "straight_hexa") planTitle.textContent = "Hexa-Column Seating Layout";
-        else if (state.layoutType === "straight_penta") planTitle.textContent = "Penta-Column Seating Layout";
-        else if (state.layoutType === "straight_quad") planTitle.textContent = "Quad-Column Seating Layout";
-        else if (state.layoutType === "lab") planTitle.textContent = "Computer Lab Seating Layout";
-        else planTitle.textContent = "Auditorium Seating Layout";
+    buildSessionSelect();
+    renderReport(state.sessions[state.current]);
+}
+
+function showNoMatch(room, dateKey) {
+    const sess = $("sessionSelect");
+    if (sess) sess.innerHTML = `<option value="">No report matches this combination</option>`;
+    const counter = $("sessionCounter");
+    if (counter) counter.textContent = "0 of 0";
+    ["prevBtn", "nextBtn"].forEach((id) => { const b = $(id); if (b) b.disabled = true; });
+
+    $("reportPages").innerHTML = `<div class="empty-state">
+        <div class="empty-title">No report for this combination</div>
+        <div class="empty-sub">${escapeHtml(room === "all" ? "That date" : room)} has no exam
+          ${dateKey === "all" ? "" : "on the selected date"}. Choose another room or date.</div>
+      </div>`;
+
+    ["statTotal", "statSeats", "statRows", "statOccupancy"].forEach((id) => {
+        const e = $(id); if (e) e.textContent = "—";
+    });
+    const warn = $("warningBar");
+    if (warn) warn.style.display = "none";
+}
+
+function buildSessionSelect() {
+    const sel = $("sessionSelect");
+    if (!sel) return;
+    sel.innerHTML = state.view.map((i) => {
+        const s = state.sessions[i];
+        const flag = s.warnings.length ? " *" : "";
+        return `<option value="${i}" ${i === state.current ? "selected" : ""}>`
+            + `${escapeHtml(s.room)} — ${escapeHtml(s.dateShort)} — ${escapeHtml(s.subjects.join(", ") || "—")}${flag}</option>`;
+    }).join("");
+    updateCounter();
+}
+
+function updateCounter() {
+    const pos = state.view.indexOf(state.current);
+    const el = $("sessionCounter");
+    if (el) el.textContent = `${pos + 1} of ${state.view.length}`;
+    const prev = $("prevBtn"), next = $("nextBtn");
+    if (prev) prev.disabled = pos <= 0;
+    if (next) next.disabled = pos >= state.view.length - 1;
+}
+
+function gotoSession(index) {
+    if (index < 0 || index >= state.sessions.length) return;
+    state.current = index;
+    const sel = $("sessionSelect");
+    if (sel) sel.value = String(index);
+    updateCounter();
+    renderReport(state.sessions[index]);
+}
+
+function step(delta) {
+    const pos = state.view.indexOf(state.current);
+    const nextPos = pos + delta;
+    if (nextPos < 0 || nextPos >= state.view.length) return;
+    gotoSession(state.view[nextPos]);
+}
+
+function bindToolbar() {
+    const dateSel = $("dateFilter");
+    if (dateSel) dateSel.addEventListener("change", () => applyFilter());
+
+    const roomSel = $("roomFilter");
+    if (roomSel) roomSel.addEventListener("change", () => applyFilter());
+
+    const sessSel = $("sessionSelect");
+    if (sessSel) sessSel.addEventListener("change", () => gotoSession(parseInt(sessSel.value, 10)));
+
+    const prev = $("prevBtn"), next = $("nextBtn");
+    if (prev) prev.addEventListener("click", () => step(-1));
+    if (next) next.addEventListener("click", () => step(1));
+
+    const scaleSel = $("scaleSelect");
+    if (scaleSel) scaleSel.addEventListener("change", () => applyScale(scaleSel.value));
+
+    const modeSel = $("printModeSelect");
+    if (modeSel) modeSel.addEventListener("change", () => applyPrintMode(modeSel.value));
+
+    document.addEventListener("keydown", (e) => {
+        if (reportView() && reportView().style.display === "none") return;
+        if (["INPUT", "SELECT", "TEXTAREA"].includes((e.target.tagName || "").toUpperCase())) return;
+        if (e.key === "ArrowRight") step(1);
+        if (e.key === "ArrowLeft") step(-1);
+    });
+}
+
+function applyScale(value) {
+    state.scale = value;
+    document.documentElement.setAttribute("data-scale", value);
+    const sel = $("scaleSelect");
+    if (sel && sel.value !== value) sel.value = value;
+    refreshPrintMetrics();
+}
+
+function applyPrintMode(value) {
+    state.printMode = value;
+    document.documentElement.setAttribute("data-print", value);
+    const sel = $("printModeSelect");
+    if (sel && sel.value !== value) sel.value = value;
+    refreshPrintMetrics();
+}
+
+function refreshPrintMetrics() {
+    const s = state.sessions[state.current];
+    const sheet = document.querySelector("#reportPages .session-sheet");
+    if (s && sheet) applyPrintMetrics(sheet, s);
+}
+
+function openReportView() {
+    uploadView().style.display = "none";
+    reportView().style.display = "block";
+    document.body.classList.add("has-report");
+}
+
+function goBack() {
+    uploadView().style.display = "block";
+    reportView().style.display = "none";
+    document.body.classList.remove("has-report");
+}
+
+/* ─── Sidebar (optional layout override) ─────────────────────────── */
+function bindSidebarControls() {
+    const ay = $("academicYear");
+    if (ay) ay.addEventListener("input", () => {
+        state.academicYear = ay.value.trim();
+        if (state.sessions.length) renderReport(state.sessions[state.current]);
+    });
+
+    const ex = $("examType");
+    if (ex) ex.addEventListener("change", () => {
+        state.examType = ex.value;
+        if (state.sessions.length) renderReport(state.sessions[state.current]);
+    });
+
+    const interleave = $("interleaveBatches");
+    if (interleave) interleave.addEventListener("change", () => {
+        state.interleaveBatches = interleave.checked;
+        if (state.sessions.length) generateAll();
+    });
+
+    const dir = $("startDirection");
+    if (dir) dir.addEventListener("change", () => {
+        state.startDirection = dir.value;
+        if (state.sessions.length) generateAll();
+    });
+
+    const rowsInput = $("totalRows");
+    if (rowsInput) rowsInput.addEventListener("change", () => {
+        const n = Math.max(1, Math.min(25, parseInt(rowsInput.value, 10) || 6));
+        rowsInput.value = n;
+        const s = state.sessions[state.current];
+        if (!s) return;
+        const draft = draftLayout();
+        draft.totalRows = n;
+        draft.rowConfigs = cloneRowConfigs(draft.rowConfigs, draft.layoutType, n);
+        stageLayout(draft);
+    });
+
+    const layoutSel = $("layoutType");
+    if (layoutSel) layoutSel.addEventListener("change", () => {
+        const draft = draftLayout();
+        draft.layoutType = layoutSel.value;
+        draft.rowConfigs = cloneRowConfigs(draft.rowConfigs, draft.layoutType, draft.totalRows);
+        stageLayout(draft);
+    });
+
+    const apply = $("applyLayoutBtn");
+    if (apply) apply.addEventListener("click", applyLayoutOverride);
+
+    const reset = $("resetLayoutBtn");
+    if (reset) reset.addEventListener("click", () => {
+        const s = state.sessions[state.current];
+        if (!s) return;
+        delete state.overrides[s.room];
+        rebuildSession(state.current);
+        renderRowConfigEditor(state.sessions[state.current].layout);
+        setStatus(`Layout for ${s.room} reset to the saved default.`);
+    });
+
+    const toggle = $("toggleConfigBtn");
+    if (toggle) toggle.addEventListener("click", () => {
+        const sidebar = document.querySelector(".sidebar");
+        sidebar.classList.toggle("hidden");
+        toggle.setAttribute("aria-expanded", sidebar.classList.contains("hidden") ? "false" : "true");
+    });
+}
+
+let layoutDraft = null;
+
+function draftLayout() {
+    if (layoutDraft) return layoutDraft;
+    const s = state.sessions[state.current];
+    layoutDraft = s ? JSON.parse(JSON.stringify(s.layout)) : autoFitLayout(36);
+    return layoutDraft;
+}
+
+function stageLayout(draft) {
+    layoutDraft = draft;
+    renderRowConfigEditor(draft);
+}
+
+function applyLayoutOverride() {
+    const s = state.sessions[state.current];
+    if (!s) return;
+    const draft = draftLayout();
+    state.overrides[s.room] = {
+        layoutType: draft.layoutType,
+        totalRows: draft.totalRows,
+        rowConfigs: draft.rowConfigs,
+        alternateSeating: !!draft.alternateSeating
+    };
+    // every session in this room follows the override
+    state.sessions.forEach((sess, i) => { if (sess.room === s.room) rebuildSession(i); });
+    setStatus(`Layout override applied to every report for ${s.room}.`);
+}
+
+function rebuildSession(index) {
+    const s = state.sessions[index];
+    if (!s) return;
+    s.layout = getRoomLayout(s.room, s.students.length);
+    const savedSeats = countSeats(s.layout);
+    const fit = fitLayoutToStudents(s.layout, s.students.length);
+    s.seats = fit.seats;
+    s.assigned = assignSeats(s.students, s.layout, state.startDirection);
+    s.warnings = s.warnings.filter((w) => !/could not be seated/.test(w));
+    s.notes = s.notes.filter((n) => !/extra row|standard layout/.test(n));
+    if (fit.short > 0) {
+        s.warnings.push(`${fit.short} student(s) could not be seated — this room needs a larger layout.`);
     }
+    if (fit.added > 0) {
+        s.notes.push(`Saved layout holds ${savedSeats} seats for ${s.students.length} students; `
+            + `${fit.added} extra row(s) added so everyone is seated.`);
+    }
+    state.allRendered = false;
+    if (index === state.current) renderReport(s);
+}
 
-    const reversed = [...assignedRows].reverse();
-    reversed.forEach((row, rIdx) => {
+function renderRowConfigEditor(layout) {
+    const container = $("rowConfigsList");
+    if (!container) return;
+    const sides = SIDE_ORDER[layout.layoutType] || SIDE_ORDER.auditorium;
+    const label = { left: "Left", middle: "Middle", right: "Right", mid1: "Mid 1", mid2: "Mid 2", mid3: "Mid 3", mid4: "Mid 4" };
+
+    container.innerHTML = layout.rowConfigs.map((cfg, i) => `
+        <div class="row-config-item">
+          <div class="row-config-header" data-idx="${i}">
+            <span>Row ${i + 1}</span>
+            <span class="row-config-sum">${sides.map((s) => `${label[s][0]}:${cfg[s] || 0}`).join(" ")}</span>
+          </div>
+          <div class="row-config-body" id="rowBody${i}">
+            <div class="seats-grid" style="grid-template-columns:repeat(${Math.min(sides.length, 3)},1fr)">
+              ${sides.map((s) => `
+                <div>
+                  <div class="seat-input-label">${label[s]}</div>
+                  <input class="seat-input" type="number" min="0" max="12" value="${cfg[s] || 0}" data-row="${i}" data-side="${s}">
+                </div>`).join("")}
+            </div>
+          </div>
+        </div>`).join("");
+
+    container.querySelectorAll(".row-config-header").forEach((h) => {
+        h.addEventListener("click", () => {
+            $("rowBody" + h.getAttribute("data-idx")).classList.toggle("open");
+        });
+    });
+
+    container.querySelectorAll(".seat-input").forEach((inp) => {
+        inp.addEventListener("change", () => {
+            const row = parseInt(inp.getAttribute("data-row"), 10);
+            const side = inp.getAttribute("data-side");
+            const val = Math.max(0, Math.min(12, parseInt(inp.value, 10) || 0));
+            inp.value = val;
+            const draft = draftLayout();
+            draft.rowConfigs[row][side] = val;
+            const sum = container.querySelector(`.row-config-header[data-idx="${row}"] .row-config-sum`);
+            if (sum) sum.textContent = sides.map((s) => `${label[s][0]}:${draft.rowConfigs[row][s] || 0}`).join(" ");
+        });
+    });
+
+    const layoutSel = $("layoutType");
+    if (layoutSel) layoutSel.value = layout.layoutType;
+    const rowsInput = $("totalRows");
+    if (rowsInput) rowsInput.value = layout.totalRows;
+    const room = $("overrideRoomName");
+    const s = state.sessions[state.current];
+    if (room && s) {
+        room.textContent = s.room + (state.overrides[s.room] ? " (overridden)" : "");
+    }
+}
+
+/* ─── Print geometry ─────────────────────────────────────────────────
+   Seat size is computed per room from its row/column count so that the
+   plan always fills — but never overruns — the space on the sheet.
+   All values are millimetres; font sizes are points.
+   ------------------------------------------------------------------- */
+const PRINT_BUDGET = {
+    /* planH = millimetres of sheet height the seat rows may occupy
+       planW = millimetres of sheet width available to a row of seats  */
+    sidebyside: { planH: 117, planW: 180, seatHMax: 22, seatWMax: 28, seatFsMax: 20, tallyFs: 11 },
+    stacked:    { planH: 97,  planW: 276, seatHMax: 15, seatWMax: 30, seatFsMax: 16, tallyFs: 7 },
+    full:       { planH: 130, planW: 276, seatHMax: 22, seatWMax: 30, seatFsMax: 20, tallyFs: 11.5 }
+};
+const SCALE_FACTOR = { sm: 0.82, md: 0.91, lg: 1, xl: 1.1 };
+
+function printMetrics(session, mode, scale) {
+    const b = PRINT_BUDGET[mode] || PRINT_BUDGET.sidebyside;
+    const k = SCALE_FACTOR[scale] || 1;
+    const sides = SIDE_ORDER[session.layout.layoutType] || SIDE_ORDER.auditorium;
+    const cfgs = session.layout.rowConfigs;
+
+    const rows = Math.max(1, cfgs.length);
+    const maxSeats = Math.max(1, ...cfgs.map((c) => sides.reduce((a, x) => a + (Number(c[x]) || 0), 0)));
+    const blocks = Math.max(1, sides.filter((x) => cfgs.some((c) => (Number(c[x]) || 0) > 0)).length);
+
+    const clamp = (lo, v, hi) => Math.max(lo, Math.min(v, hi));
+    // vertical: rows share the plan height, allowing 1.3mm between rows
+    const ROW_GAP = 1.9;                       // matches .seating-row margin in print
+    const h = clamp(4.5, Math.min(b.planH / rows - ROW_GAP, b.seatHMax * k), b.seatHMax * k);
+    // horizontal: seats share the width, minus aisles (6mm) and the row label (12mm)
+    const w = clamp(10, Math.min((b.planW - (blocks - 1) * 6 - 12) / maxSeats - 1, b.seatWMax * k), b.seatWMax * k);
+    // a 5-character roll number must fit inside the box
+    const fs = clamp(6.5, Math.min((w - 2) / 1.06, (h - 1.4) / 0.353, b.seatFsMax * k), 18);
+
+    return {
+        seatW: w.toFixed(2) + "mm",
+        seatH: h.toFixed(2) + "mm",
+        seatFs: fs.toFixed(2) + "pt",
+        tallyFs: (b.tallyFs * k).toFixed(2) + "pt"
+    };
+}
+
+function applyPrintMetrics(el, session) {
+    const m = printMetrics(session, state.printMode, state.scale);
+    el.style.setProperty("--seat-w-print", m.seatW);
+    el.style.setProperty("--seat-h-print", m.seatH);
+    el.style.setProperty("--seat-fs-print", m.seatFs);
+    el.style.setProperty("--tally-fs-print", m.tallyFs);
+}
+
+/* ─── Report rendering ───────────────────────────────────────────── */
+function planTitleFor(layoutType) {
+    return {
+        auditorium: "Auditorium Seating Layout",
+        lab: "Computer Lab Seating Layout",
+        straight_quad: "Quad-Column Seating Layout",
+        straight_penta: "Penta-Column Seating Layout",
+        straight_hexa: "Hexa-Column Seating Layout"
+    }[layoutType] || "Seating Layout";
+}
+
+function renderReport(session) {
+    if (!session) return;
+    layoutDraft = null;
+
+    const host = $("reportPages");
+    host.innerHTML = "";
+    host.appendChild(buildSessionNode(session, { interactive: true }));
+
+    // statistics strip (screen only)
+    const occ = session.seats ? Math.round((session.students.length / session.seats) * 100) : 0;
+    $("statTotal").textContent = session.students.length;
+    $("statSeats").textContent = session.seats;
+    $("statRows").textContent = session.layout.rowConfigs.length;
+    $("statOccupancy").textContent = session.seats ? occ + "%" : "—";
+
+    const warn = $("warningBar");
+    const items = session.warnings.map((w) => `<div class="warn-item">${escapeHtml(w)}</div>`)
+        .concat(session.notes.map((n) => `<div class="note-item">${escapeHtml(n)}</div>`));
+    warn.className = "warning-bar no-print" + (session.warnings.length ? " is-warning" : " is-note");
+    warn.style.display = items.length ? "block" : "none";
+    warn.innerHTML = items.join("");
+
+    renderRowConfigEditor(session.layout);
+}
+
+/* One session = two printed pages (plan + attendance tally). */
+function buildSessionNode(session, opts = {}) {
+    const wrap = document.createElement("div");
+    wrap.className = "session-sheet";
+    wrap.setAttribute("data-room", session.room);
+
+    /* Exam details as one horizontal band — label and value inline,
+       items running left to right so the block costs the least height. */
+    const meta = [
+        ["Academic Year", state.academicYear || session.academicYear || "—"],
+        ["Examination", state.examType || "—"],
+        ["Exam Date", session.dateLong],
+        ["Session Time", session.time],
+        ["Semester", session.sems.join(", ") || "—"],
+        ["Students", String(session.students.length)],
+        ["Programme(s)", session.programmes.join("  •  ") || "—"],
+        ["Subject(s)", session.subjects.join("  •  ") || "—"],
+        ["Roll No. Range", session.rollRanges.join(",  ") || "—"],
+        ["Absent", "strike through the roll number"]
+    ];
+
+    wrap.innerHTML = `
+      <section class="report-doc doc-plan" aria-label="Seating plan">
+        ${headerBand(session, "Supervisor's Report — Seating Plan", "Sheet 1")}
+        <div class="meta-band">
+          ${meta.map(([k, v]) => `
+            <span class="mb-item">
+              <span class="mb-label">${escapeHtml(k)}</span>
+              <span class="mb-value">${escapeHtml(v)}</span>
+            </span>`).join("")}
+        </div>
+
+        <div class="seating-plan-area">
+          <div class="seating-plan-head">
+            <span class="seating-plan-title">${planTitleFor(session.layout.layoutType)}</span>
+          </div>
+          <div class="auditorium-wrapper">
+            <div class="seating-grid ${gridClass(session.layout.layoutType)}"></div>
+            <div class="board">Board / Stage</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="report-doc doc-tally" aria-label="Attendance and answer book record">
+        ${headerBand(session, "Attendance & Answer Book Record", "Sheet 2")}
+        <div class="tally-strip">
+          <div><span class="ts-label">Date</span><span class="ts-value">${escapeHtml(session.dateShort)}</span></div>
+          <div><span class="ts-label">Time</span><span class="ts-value">${escapeHtml(session.time)}</span></div>
+          <div><span class="ts-label">Subject</span><span class="ts-value">${escapeHtml(session.subjects.join(", ") || "—")}</span></div>
+          <div><span class="ts-label">Students</span><span class="ts-value">${session.students.length}</span></div>
+        </div>
+
+        <div class="tally-section">
+          <div class="section-heading">Student Attendance &amp; Answer Book Signature Sheet</div>
+          <div class="tally-split">${tallyColumns(session.students.length)
+            .map(() => `
+            <table class="tally-table">
+              <thead>
+                <tr>
+                  <th class="center col-sr">Sr.</th>
+                  <th class="col-roll">Roll No.</th>
+                  <th class="center col-supp">Supp.</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>`).join("")}</div>
+        </div>
+
+      </section>
+
+      <section class="report-doc doc-bottom" aria-label="Answer books and signatures">
+          <div class="acc-band">
+            ${accGroup("Answer Books", ["Issued", "Used", "Unused"])}
+            ${accGroup("Supplements", ["Issued", "Used", "Unused"])}
+            ${accGroup("Total", ["Present", "Absent"])}
+          </div>
+          <div class="sig-grid">
+            ${sigItem("Supervisor 1")}
+            ${sigItem("Supervisor 2")}
+            ${sigItem("Exam Incharge")}
+          </div>
+      </section>`;
+
+    // seating grid
+    const grid = wrap.querySelector(".seating-grid");
+    renderSeatingGrid(grid, session);
+
+    // tally rows, distributed down each column in turn
+    const bodies = wrap.querySelectorAll(".tally-table tbody");
+    const slices = tallyColumns(session.students.length);
+    const row = (n, roll, spare) =>
+        `<tr${spare ? ' class="spare"' : ""}><td class="center">${n}</td>`
+        + `<td class="roll">${escapeHtml(roll)}</td><td class="supp center"></td></tr>`;
+
+    const n = session.students.length;
+    slices.forEach(([from, to], ci) => {
+        let html = "";
+        for (let i = from; i < to; i++) {
+            html += i < n ? row(i + 1, session.students[i], false)
+                          : row(i + 1, "", true);        // spare line for late entries
+        }
+        bodies[ci].innerHTML = html;
+    });
+
+    applyPrintMetrics(wrap, session);
+
+    if (opts.interactive) {
+        wrap.querySelectorAll(".seat-box:not(.empty)").forEach((box) => {
+            box.addEventListener("click", () => box.classList.toggle("absent"));
+            box.title = "Click to mark absent";
+        });
+    }
+    return wrap;
+}
+
+/* Splits the attendance list into side-by-side columns. The row limit is
+   how many rows fit the height left for it on the sheet. On the one-sheet
+   layout that band is only ~20% of the page, so it uses more and shorter
+   columns. Spare rows count in the split, so columns come out even. */
+const TALLY_SPARE_ROWS = 3;
+
+function tallyColumns(count, mode) {
+    const n = Math.max(count, 0);
+    const total = n + TALLY_SPARE_ROWS;
+    const m = mode || state.printMode;
+    /* [rows per column, maximum columns] for the space that mode gives
+       the attendance sheet */
+    const shape = { sidebyside: [18, 3], stacked: [6, 7], full: [10, 4] }[m] || [26, 2];
+    const cols = Math.min(shape[1], Math.max(1, Math.ceil(n / shape[0]) || 1));
+    const per = Math.ceil(total / cols);
+
+    const out = [];
+    for (let c = 0; c < cols; c++) {
+        const from = c * per;
+        if (from >= total && c > 0) break;
+        out.push([from, Math.min(total, from + per)]);
+    }
+    return out;
+}
+
+function gridClass(layoutType) {
+    if (layoutType === "straight_quad") return "lab-layout quad-layout";
+    if (layoutType === "straight_penta") return "lab-layout penta-layout";
+    if (layoutType === "straight_hexa") return "lab-layout hexa-layout";
+    if (layoutType === "lab") return "lab-layout";
+    return "";
+}
+
+function headerBand(session, docType, pageLabel) {
+    return `
+      <header class="report-header-band">
+        <div class="report-header-brand">
+          <div class="crest">MPSTME</div>
+          <div>
+            <div class="inst-name">SVKM's NMIMS</div>
+            <div class="inst-tagline">Narsee Monjee Institute of Management Studies &middot; Deemed to be University</div>
+            <div class="doc-type">${escapeHtml(docType)}</div>
+          </div>
+        </div>
+        <div class="report-header-meta">
+          <div class="room-badge-lg">${escapeHtml(session.room)}</div>
+          <div class="page-label">${escapeHtml(pageLabel)}</div>
+        </div>
+      </header>`;
+}
+
+function accGroup(title, fields) {
+    return `<div class="acc-group">
+        <span class="acc-cap">${title}</span>
+        ${fields.map((l) => `<span class="acc-f"><span class="acc-f-label">${l}</span><span class="acc-line"></span></span>`).join("")}
+      </div>`;
+}
+
+function sigItem(label) {
+    return `<div class="sig-item">
+        <div class="sig-label">${label}</div>
+        <div class="sig-name-line"></div>
+        <div class="sig-meta"><span>Name</span><span>Signature</span></div>
+      </div>`;
+}
+
+function renderSeatingGrid(grid, session) {
+    grid.innerHTML = "";
+    const layout = session.layout;
+    const sides = SIDE_ORDER[layout.layoutType] || SIDE_ORDER.auditorium;
+    const rows = [...session.assigned];
+
+    // widest block per column, so short rows stay aligned
+    const widest = {};
+    sides.forEach((side) => {
+        widest[side] = layout.rowConfigs.reduce((m, c) => Math.max(m, Number(c[side]) || 0), 0);
+    });
+
+    // R1 sits nearest the board, so render from the back of the room forward
+    rows.slice().reverse().forEach((row, rIdx) => {
+        const rowNum = rows.length - rIdx;
         const rowEl = document.createElement("div");
         rowEl.className = "seating-row";
 
-        const rowNum = reversed.length - rIdx;
+        const visible = sides.filter((s) => widest[s] > 0);
+        visible.forEach((side, i) => {
+            const group = makeSeatGroup(row[side] || [], widest[side]);
+            if (i === 0) {
+                group.classList.add("curve-left-max");
+                group.insertAdjacentHTML("afterbegin", `<div class="row-number">R${rowNum}</div>`);
+            }
+            if (i === visible.length - 1) group.classList.add("curve-right-max");
+            rowEl.appendChild(group);
+            if (i < visible.length - 1) {
+                rowEl.appendChild(createAisle("Path", visible.length === 2 ? "curve-center" : "curve-left-mid"));
+            }
+        });
 
-        if (state.layoutType === "straight_quad") {
-            const makeQuadBlock = (seats, side, labelText = null) => {
-                const group = makeSeatGroup(seats);
-                if (labelText) {
-                    group.classList.add("curve-left-max");
-                    group.insertAdjacentHTML('afterbegin', `<div class="row-number">${labelText}</div>`);
-                }
-                if (seats.length === 0) {
-                    const maxWidth = state.rowConfigs.reduce((max, c) => Math.max(max, c[side] || 0), 0);
-                    for (let i = 0; i < maxWidth; i++) {
-                        const spacer = document.createElement("div");
-                        spacer.className = "seat-box empty";
-                        spacer.style.visibility = "hidden";
-                        group.appendChild(spacer);
-                    }
-                }
-                return group;
-            };
-
-            rowEl.appendChild(makeQuadBlock(row.left || [], "left", `R${rowNum}`));
-            rowEl.appendChild(createAisle("Path"));
-            rowEl.appendChild(makeQuadBlock(row.mid1 || [], "mid1"));
-            rowEl.appendChild(createAisle("Path"));
-            rowEl.appendChild(makeQuadBlock(row.mid2 || [], "mid2"));
-            rowEl.appendChild(createAisle("Path"));
-            rowEl.appendChild(makeQuadBlock(row.right || [], "right"));
-        } 
-        else if (state.layoutType === "straight_hexa") {
-            const makeHexaBlock = (seats, side, labelText = null) => {
-                const group = makeSeatGroup(seats);
-                if (labelText) {
-                    group.classList.add("curve-left-max");
-                    group.insertAdjacentHTML('afterbegin', `<div class="row-number">${labelText}</div>`);
-                }
-                if (seats.length === 0) {
-                    const maxWidth = state.rowConfigs.reduce((max, c) => Math.max(max, c[side] || 0), 0);
-                    for (let i = 0; i < maxWidth; i++) {
-                        const spacer = document.createElement("div");
-                        spacer.className = "seat-box empty";
-                        spacer.style.visibility = "hidden";
-                        group.appendChild(spacer);
-                    }
-                }
-                return group;
-            };
-
-            rowEl.appendChild(makeHexaBlock(row.left || [], "left", `R${rowNum}`));
-            rowEl.appendChild(createAisle("Path"));
-            rowEl.appendChild(makeHexaBlock(row.mid1 || [], "mid1"));
-            rowEl.appendChild(createAisle("Path"));
-            rowEl.appendChild(makeHexaBlock(row.mid2 || [], "mid2"));
-            rowEl.appendChild(createAisle("Path"));
-            rowEl.appendChild(makeHexaBlock(row.mid3 || [], "mid3"));
-            rowEl.appendChild(createAisle("Path"));
-            rowEl.appendChild(makeHexaBlock(row.mid4 || [], "mid4"));
-            rowEl.appendChild(createAisle("Path"));
-            rowEl.appendChild(makeHexaBlock(row.right || [], "right"));
-        } 
-        else if (state.layoutType === "straight_penta") {
-            const makePentaBlock = (seats, side, labelText = null) => {
-                const group = makeSeatGroup(seats);
-                if (labelText) {
-                    group.classList.add("curve-left-max");
-                    group.insertAdjacentHTML('afterbegin', `<div class="row-number">${labelText}</div>`);
-                }
-                if (seats.length === 0) {
-                    const maxWidth = state.rowConfigs.reduce((max, c) => Math.max(max, c[side] || 0), 0);
-                    for (let i = 0; i < maxWidth; i++) {
-                        const spacer = document.createElement("div");
-                        spacer.className = "seat-box empty";
-                        spacer.style.visibility = "hidden";
-                        group.appendChild(spacer);
-                    }
-                }
-                return group;
-            };
-
-            rowEl.appendChild(makePentaBlock(row.left || [], "left", `R${rowNum}`));
-            rowEl.appendChild(createAisle("Path"));
-            rowEl.appendChild(makePentaBlock(row.mid1 || [], "mid1"));
-            rowEl.appendChild(createAisle("Path"));
-            rowEl.appendChild(makePentaBlock(row.mid2 || [], "mid2"));
-            rowEl.appendChild(createAisle("Path"));
-            rowEl.appendChild(makePentaBlock(row.mid3 || [], "mid3"));
-            rowEl.appendChild(createAisle("Path"));
-            rowEl.appendChild(makePentaBlock(row.right || [], "right"));
-        } 
-        else if (state.layoutType === "lab" || state.layoutType === "straight_2_2_2" || (row.middle && row.middle.length > 0)) {
-            const makeLabBlock = (seats, side, labelText = null) => {
-                const group = makeSeatGroup(seats);
-                if (labelText) {
-                    group.classList.add("curve-left-max");
-                    group.insertAdjacentHTML('afterbegin', `<div class="row-number">${labelText}</div>`);
-                }
-                if (seats.length === 0) {
-                    const maxWidth = state.rowConfigs.reduce((max, c) => Math.max(max, c[side] || 0), 0);
-                    for (let i = 0; i < maxWidth; i++) {
-                        const spacer = document.createElement("div");
-                        spacer.className = "seat-box empty";
-                        spacer.style.visibility = "hidden";
-                        group.appendChild(spacer);
-                    }
-                }
-                return group;
-            };
-
-            rowEl.appendChild(makeLabBlock(row.left || [], "left", `R${rowNum}`));
-            rowEl.appendChild(createAisle("Path", "curve-left-mid"));
-            rowEl.appendChild(makeLabBlock(row.middle || [], "middle"));
-            rowEl.appendChild(createAisle("Path", "curve-right-mid"));
-            rowEl.appendChild(makeLabBlock(row.right || [], "right"));
-        } else {
-            const leftGroup = makeSeatGroup(row.left);
-            leftGroup.classList.add("curve-left-max");
-            leftGroup.insertAdjacentHTML('afterbegin', `<div class="row-number">R${rowNum}</div>`);
-            rowEl.appendChild(leftGroup);
-
-            rowEl.appendChild(createAisle("Path", "curve-center"));
-
-            const rightGroup = makeSeatGroup(row.right);
-            rightGroup.classList.add("curve-right-max");
-            rowEl.appendChild(rightGroup);
-        }
-
-        seatingGrid.appendChild(rowEl);
+        grid.appendChild(rowEl);
     });
-
-    // Page 2: tally
-    document.getElementById("p2Room").textContent = "ROOM: " + info.room;
-
-    const tbody = document.getElementById("tallyBody");
-    tbody.innerHTML = "";
-
-    // ✅ SINGLE COLUMN LIST
-    for (let i = 0; i < allStudents.length; i++) {
-        const tr = document.createElement("tr");
-
-        tr.innerHTML = `
-          <td class="center">${i + 1}</td>
-          <td class="roll">${allStudents[i]}</td>
-          <td class="supp center"></td>
-    `;
-
-        tbody.appendChild(tr);
-    }
-
 }
 
-function makeSeatGroup(seats) {
+function makeSeatGroup(seats, pad = 0) {
     const group = document.createElement("div");
     group.className = "seat-group";
-    seats.forEach((roll) => {
+    const list = seats.slice();
+    while (list.length < pad) list.push("HIDDEN");
+    list.forEach((roll) => {
         const box = document.createElement("div");
         if (roll === "HIDDEN") {
-            box.className = "seat-box empty";
-            box.style.visibility = "hidden";
-            box.textContent = "";
+            box.className = "seat-box empty spacer";
         } else {
             box.className = "seat-box" + (roll ? "" : " empty");
             box.textContent = roll || "";
@@ -1808,47 +2409,59 @@ function createAisle(label, curveClass = "") {
     return a;
 }
 
-function createNumberedBlock(seats, rowNum) {
-    const group = makeSeatGroup(seats);
-    group.classList.add("curve-left-max");
-    group.insertAdjacentHTML('afterbegin', `<div class="row-number">R${rowNum}</div>`);
-    return group;
-}
-
-// ─── Print button ─────────────────────────────────────────────────────
+/* ─── Printing ───────────────────────────────────────────────────── */
 function printReport() {
+    document.body.classList.remove("print-all");
     window.print();
 }
 
-// ─── Back button ─────────────────────────────────────────────────────
-function goBack() {
-    uploadView().style.display = "block";
-    reportView().style.display = "none";
+function printAll() {
+    const targets = state.view.map((i) => state.sessions[i]);
+    if (!targets.length) return;
+
+    const host = $("printAllHost");
+    host.innerHTML = "";
+    setStatus(`Preparing ${targets.length} reports for printing…`);
+
+    const frag = document.createDocumentFragment();
+    targets.forEach((s) => frag.appendChild(buildSessionNode(s)));
+    host.appendChild(frag);
+
+    document.body.classList.add("print-all");
+    setStatus(`${targets.length} reports ready. Use the browser print dialog.`);
+    setTimeout(() => {
+        window.print();
+        document.body.classList.remove("print-all");
+        host.innerHTML = "";
+    }, 150);
 }
 
+/* ─── Export: seat allocation as CSV ─────────────────────────────── */
+function exportCsv() {
+    if (!state.sessions.length) return;
+    const head = ["Exam Date", "Time", "Room", "Programme", "Subject", "Semester", "Row", "Column", "Seat", "Roll Number"];
+    const lines = [head.join(",")];
+    const q = (v) => `"${String(v == null ? "" : v).replace(/"/g, '""')}"`;
 
-
-function downloadPDF() {
-  const element = document.getElementById("reportView");
-
-  element.classList.add("pdf-mode");
-
-  const opt = {
-    margin: 0,
-    filename: "NMIMS_Seating_Report.pdf",
-    image: { type: "jpeg", quality: 0.98 },
-    html2canvas: {
-      scale: 2,
-      useCORS: true
-    },
-    jsPDF: {
-      unit: "mm",
-      format: "a4",
-      orientation: "landscape"
+    for (const s of state.sessions) {
+        const sides = SIDE_ORDER[s.layout.layoutType] || SIDE_ORDER.auditorium;
+        s.assigned.forEach((row, rIdx) => {
+            sides.forEach((side) => {
+                (row[side] || []).forEach((roll, cIdx) => {
+                    if (!roll) return;
+                    lines.push([s.dateShort, s.time, s.room, s.programmes.join(" | "),
+                        s.subjects.join(" | "), s.sems.join(" | "),
+                        "R" + (rIdx + 1), side, cIdx + 1, roll].map(q).join(","));
+                });
+            });
+        });
     }
-  };
 
-  html2pdf().set(opt).from(element).save().then(() => {
-    element.classList.remove("pdf-mode");
-  });
+    const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8;" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "NMIMS_seat_allocation.csv";
+    a.click();
+    URL.revokeObjectURL(a.href);
+    setStatus("Seat allocation exported as CSV.");
 }
