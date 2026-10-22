@@ -107,7 +107,7 @@ body {
 }
 .brand { display: flex; align-items: center; gap: 12px; }
 .brand-logo {
-  width: 38px; height: 38px;
+  height: 38px; min-width: 38px; padding: 0 8px; white-space: nowrap;
   background: var(--gold);
   border-radius: 5px;
   display: flex; align-items: center; justify-content: center;
@@ -271,9 +271,12 @@ body {
   padding: 11px 15px;
   margin-bottom: 14px;
 }
+.warning-bar.is-error   { background: #fdf0ee; border-color: #e8c0b9; border-left-color: var(--red); }
 .warning-bar.is-warning { background: var(--amber-bg); border-color: #e6d3a3; border-left-color: var(--gold); }
 .warning-bar.is-note    { background: var(--gray-100); border-left-color: var(--gray-400); }
-.warn-item, .note-item { font-size: 12.5px; line-height: 1.65; }
+.err-item, .warn-item, .note-item { font-size: 12.5px; line-height: 1.65; }
+.err-item { color: var(--red); font-weight: 700; }
+.err-item::before { content: "Error: "; font-weight: 700; }
 .warn-item { color: var(--amber); font-weight: 600; }
 .note-item { color: var(--gray-600); }
 .warn-item::before { content: "Attention: "; font-weight: 700; }
@@ -423,6 +426,32 @@ body {
   font-size: var(--meta-fs);
   line-height: 1.25;
   overflow-wrap: break-word;
+}
+
+/* Error band — prints on the sheet so the problem reaches the invigilator */
+.error-band {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 7px 16px;
+  background: #fdf0ee;
+  border-bottom: 1px solid var(--gray-300);
+  border-left: 4px solid var(--red);
+  font-family: var(--font-ui);
+}
+.error-tag {
+  flex-shrink: 0;
+  font-size: var(--label-fs);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--red);
+}
+.error-list {
+  font-size: calc(var(--meta-fs) - 1px);
+  font-weight: 700;
+  color: var(--red);
+  line-height: 1.3;
 }
 
 /* Seating plan */
@@ -701,6 +730,21 @@ body {
     border: 1.2pt solid var(--navy) !important;
   }
   .meta-band, .seating-plan-area, .bottom-band, .tally-strip { background: #fff !important; }
+  .error-band {
+    background: #fff !important;
+    border-left: 2pt solid var(--red) !important;
+    border-bottom: .8pt solid var(--red) !important;
+  }
+  .error-tag, .error-list { color: var(--red) !important; }
+  :root[data-print="sidebyside"] .error-band { padding: 1.2mm 4mm !important; gap: 2.5mm !important; }
+  :root[data-print="sidebyside"] .error-tag { font-size: 6.4pt !important; }
+  :root[data-print="sidebyside"] .error-list { font-size: 7.8pt !important; }
+  :root[data-print="stacked"] .error-band { padding: 1mm 4mm !important; gap: 2mm !important; }
+  :root[data-print="stacked"] .error-tag { font-size: 6pt !important; }
+  :root[data-print="stacked"] .error-list { font-size: 7.4pt !important; }
+  :root[data-print="full"] .error-band { padding: 1.6mm 5mm !important; gap: 3mm !important; }
+  :root[data-print="full"] .error-tag { font-size: 7.4pt !important; }
+  :root[data-print="full"] .error-list { font-size: 9.5pt !important; }
   .acc-line { border-bottom: .6pt solid var(--navy) !important; }
   .tally-table th {
     background: #fff !important; color: var(--navy) !important;
