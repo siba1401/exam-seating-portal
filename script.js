@@ -930,6 +930,52 @@ const ROOM_DEFAULTS = {
    room layout is taken from ROOM_DEFAULTS for the allotted room.
    ═══════════════════════════════════════════════════════════════════ */
 
+/* ─── Flat (bench) classrooms ─────────────────────────────────────
+   Official bench counts supplied by the examination office. Every
+   bench seats two, so a room holds `benches` students under single
+   seating and 2 x benches under double seating. Where a room's saved
+   layout disagrees with this figure, the figure wins and the row
+   arrangement is rebuilt to match it — the report says when that
+   happened, because the rebuilt arrangement is an estimate.
+   ----------------------------------------------------------------- */
+const BENCH_ROOMS = {
+    "E. CR 107": 27, "E. CR 108": 26,
+    "E. CR G1": 25, "E. CR G2": 24, "E. CR G3": 30, "E. CR G4": 27, "E. CR G5": 27,
+    "E. TR 201": 26, "E. TR 202": 26, "E. TR 203": 25,
+    "E. CR 202": 27, "E. CR 208": 30, "E. CR 209": 29,
+    "E. TR 301": 25, "E. TR 302": 25, "E. TR 303": 23, "E. CR 302": 25,
+    "E. TR 401": 26, "E. CR 402": 30, "E. CR 407": 27, "E. CR 408": 27,
+    "E. TR 501": 26, "E. CR 502": 27, "E. CR 508": 26, "E. CR 509": 28,
+    "E. TR 601": 26, "E. CR 602": 28, "E. CR 608": 30, "E. CR 609": 27,
+    "E. CR 801": 24
+};
+
+/* Match a room name whatever prefix the spreadsheet uses, so
+   "CR 508", "E. CR 508" and "E.CR508" all resolve to the same room. */
+function benchCountFor(room) {
+    const want = squash(room).replace(/^e/, "");
+    for (const key of Object.keys(BENCH_ROOMS)) {
+        if (squash(key).replace(/^e/, "") === want) return BENCH_ROOMS[key];
+    }
+    return null;
+}
+
+/* ─── Institute branding ──────────────────────────────────────────
+   Everything that appears in the report header is set here, so
+   rebranding means editing these four lines and nothing else.
+   ---------------------------------------------------------------
+   crest   short text in the badge (2-8 characters), or "" to hide it
+   logo    path to an image file, e.g. "logo.png" — used instead of
+           the crest text when it is set; put the file next to
+           index.html. The badge sizes itself to whatever you give it.
+   ----------------------------------------------------------------- */
+const INSTITUTE = {
+    crest: "MPSTME",
+    logo: "",
+    name: "SVKM's NMIMS",
+    tagline: "Narsee Monjee Institute of Management Studies \u00b7 Deemed to be University"
+};
+
 /* Column order used when filling seats, per layout type. */
 const SIDE_ORDER = {
     auditorium: ["left", "middle", "right"],
@@ -972,6 +1018,7 @@ const $ = (id) => document.getElementById(id);
 
 /* ─── Init ───────────────────────────────────────────────────────── */
 document.addEventListener("DOMContentLoaded", () => {
+    loadSavedLayouts();
     bindUploadCards();
     bindSidebarControls();
     bindToolbar();
@@ -1427,7 +1474,7 @@ function parseRollRange(rangeStr) {
     const results = [];
     const str = String(rangeStr || "");
     for (const part of str.split(/[,;]/).map((p) => p.trim()).filter(Boolean)) {
-        const seg = part.split(/\s*[-–to]+\s*/i).filter(Boolean);
+        const seg = part.split(/\s*(?:-|–|—|to)\s*/i).filter(Boolean);
         const a = seg[0] || "";
         const b = seg.length > 1 ? seg[seg.length - 1] : a;
         const prefix = (a.match(/[A-Za-z]+/) || [""])[0];
@@ -1449,35 +1496,51 @@ function rollInRanges(roll, ranges) {
         num >= r.start && num <= r.end && normalizeStr(prefix) === normalizeStr(r.prefix));
 }
 
-/* Students for one allocation row: match on range, then narrow by
-   subject and programme when the roll list carries those columns. */
+/* Students for one allocation row. A roll number is seated only when it
+   actually appears in the roll call file AND belongs to that row's
+   programme and subject — anything else is left out and counted, so the
+   report can say why. */
 function studentsForAllocation(metaRow, ranges) {
-    const wantSubject = normalizeStr(pick(metaRow, ["Subject", "Subjects"]));
-    const wantProg = normalizeStr(pick(metaRow, ["Prog. Name & Stream", "Programme", "Prog Name", "Program"]));
+    const SUBJ_KEYS = ["SUBJECT", "Subject", "Subjects"];
+    const PROG_KEYS = ["Prog. Name & Stream", "Programme", "Prog Name", "Program"];
+    const ROLL_KEYS = ["Roll Number", "Roll No.", "Roll No", "RollNumber"];
 
-    const inRange = (state.rollData || []).filter((st) =>
-        rollInRanges(pick(st, ["Roll Number", "Roll No.", "Roll No", "RollNumber"]), ranges));
+    const wantSubject = normalizeStr(pick(metaRow, SUBJ_KEYS));
+    const wantProg = normalizeStr(pick(metaRow, PROG_KEYS));
+    const data = state.rollData || [];
 
-    const narrow = (rows, key, want) => {
-        if (!want) return rows;
-        const hit = rows.filter((st) => normalizeStr(pick(st, key)) === want);
-        return hit.length ? hit : rows;      // ignore the filter if the column is absent/different
-    };
+    // a filter is only applied when the roll call file actually carries
+    // that column; otherwise there is nothing to match against
+    const hasColumn = (keys) => data.some((st) => String(pick(st, keys)).trim() !== "");
 
-    let rows = narrow(inRange, ["SUBJECT", "Subject", "Subjects"], wantSubject);
-    rows = narrow(rows, ["Prog. Name & Stream", "Programme", "Prog Name", "Program"], wantProg);
+    const inRange = data.filter((st) => rollInRanges(pick(st, ROLL_KEYS), ranges));
 
-    const out = [];
+    let rows = inRange;
+    let droppedSubject = 0, droppedProgramme = 0;
+
+    if (wantSubject && hasColumn(SUBJ_KEYS)) {
+        const before = rows.length;
+        rows = rows.filter((st) => normalizeStr(pick(st, SUBJ_KEYS)) === wantSubject);
+        droppedSubject = before - rows.length;
+    }
+    if (wantProg && hasColumn(PROG_KEYS)) {
+        const before = rows.length;
+        rows = rows.filter((st) => normalizeStr(pick(st, PROG_KEYS)) === wantProg);
+        droppedProgramme = before - rows.length;
+    }
+
+    const rolls = [];
     const seen = new Set();
     for (const st of rows) {
-        const roll = String(pick(st, ["Roll Number", "Roll No.", "Roll No", "RollNumber"])).trim();
-        if (roll && !seen.has(roll)) { seen.add(roll); out.push(roll); }
+        const roll = String(pick(st, ROLL_KEYS)).trim();
+        if (roll && !seen.has(roll)) { seen.add(roll); rolls.push(roll); }
     }
-    out.sort((a, b) => {
+    rolls.sort((a, b) => {
         const pa = (a.match(/[A-Za-z]+/) || [""])[0], pb = (b.match(/[A-Za-z]+/) || [""])[0];
         return pa === pb ? extractNum(a) - extractNum(b) : pa.localeCompare(pb);
     });
-    return out;
+
+    return { rolls, inRangeCount: inRange.length, droppedSubject, droppedProgramme };
 }
 
 /* ─── Room layout ────────────────────────────────────────────────── */
@@ -1513,22 +1576,95 @@ function autoFitLayout(count) {
     };
 }
 
+/* Rebuilds a flat room as an even bench grid holding exactly `benches`
+   benches, keeping the room's own layout type and its widest row shape.
+   The short row goes nearest the board, which is how these rooms are
+   actually laid out. */
+function benchGrid(layoutType, benches, template) {
+    const sides = SIDE_ORDER[layoutType] || SIDE_ORDER.auditorium;
+    const perRow = sides.reduce((a, side) => a + Math.floor((Number(template[side]) || 0) / 2), 0) || 3;
+    const full = Math.floor(benches / perRow);
+    const rest = benches % perRow;
+
+    const rows = [];
+    if (rest) {                                   // short row first, nearest the board
+        const cfg = {};
+        let left = rest;
+        sides.forEach((side) => {
+            const cap = Math.floor((Number(template[side]) || 0) / 2);
+            const take = Math.min(cap, left);
+            cfg[side] = take * 2;
+            left -= take;
+        });
+        rows.push(cfg);
+    }
+    for (let i = 0; i < full; i++) {
+        const cfg = {};
+        sides.forEach((side) => { cfg[side] = Number(template[side]) || 0; });
+        rows.push(cfg);
+    }
+    return rows;
+}
+
 function getRoomLayout(room, count) {
     const override = state.overrides[room];
     if (override) return JSON.parse(JSON.stringify(override));
 
+    const benches = benchCountFor(room);
     const d = ROOM_DEFAULTS[room];
-    if (!d) return autoFitLayout(count);
+
+    if (!d) {
+        if (benches) {                            // known flat room, no saved layout
+            const template = { left: 2, middle: 2, right: 2 };
+            const rowConfigs = benchGrid("lab", benches, template);
+            return {
+                layoutType: "lab", totalRows: rowConfigs.length, rowConfigs,
+                alternateSeating: true, isFallback: false,
+                benchRoom: true, benchTarget: benches, benchRebuilt: true
+            };
+        }
+        return autoFitLayout(count);
+    }
 
     const layoutType = d.layoutType || "auditorium";
     const totalRows = d.totalRows || 6;
-    return {
+    const layout = {
         layoutType,
         totalRows,
         rowConfigs: cloneRowConfigs(d.rowConfigs, layoutType, totalRows),
         alternateSeating: !!d.alternateSeating,
-        isFallback: false
+        isFallback: false,
+        benchRoom: !!benches,
+        benchTarget: benches
     };
+
+    // the examination office's bench count is the authority
+    if (benches) {
+        const have = usableSeats(layout, "single");
+        if (have !== benches) {
+            const sides = SIDE_ORDER[layoutType] || SIDE_ORDER.auditorium;
+            const widest = layout.rowConfigs.reduce((best, cfg) => {
+                const w = sides.reduce((a, x) => a + (Number(cfg[x]) || 0), 0);
+                const bw = sides.reduce((a, x) => a + (Number(best[x]) || 0), 0);
+                return w > bw ? cfg : best;
+            }, layout.rowConfigs[0] || {});
+            layout.rowConfigs = benchGrid(layoutType, benches, widest);
+            layout.totalRows = layout.rowConfigs.length;
+            layout.benchRebuilt = true;
+            layout.benchWas = have;
+        }
+    }
+    return layout;
+}
+
+/* Seats a layout can actually use. Under single seating no two occupied
+   seats may touch, so a block of n seats holds ceil(n / 2) students. */
+function usableSeats(layout, density) {
+    const sides = SIDE_ORDER[layout.layoutType] || SIDE_ORDER.auditorium;
+    return layout.rowConfigs.reduce((sum, cfg) => sum + sides.reduce((a, side) => {
+        const n = Number(cfg[side]) || 0;
+        return a + (density === "single" ? Math.ceil(n / 2) : n);
+    }, 0), 0);
 }
 
 function countSeats(layout) {
@@ -1540,19 +1676,23 @@ function countSeats(layout) {
 /* A supervisor report must never drop a student. If the saved layout for
    the room holds fewer seats than the students allotted to it, extend it
    with extra rows (shaped like the widest existing row) and report it. */
-function fitLayoutToStudents(layout, count) {
+function fitLayoutToStudents(layout, count, density) {
     const sides = SIDE_ORDER[layout.layoutType] || SIDE_ORDER.auditorium;
     const rowSeats = (cfg) => sides.reduce((a, s) => a + (Number(cfg[s]) || 0), 0);
+    const rowHolds = (cfg) => sides.reduce((a, s) => {
+        const n = Number(cfg[s]) || 0;
+        return a + (density === "single" ? Math.ceil(n / 2) : n);
+    }, 0);
 
-    let seats = countSeats(layout);
+    let seats = usableSeats(layout, density);
     if (count <= seats) return { added: 0, short: 0, seats };
 
     // widest row is the best template for an extra row
     const template = layout.rowConfigs.reduce(
         (best, cfg) => (rowSeats(cfg) > rowSeats(best) ? cfg : best),
         layout.rowConfigs[0] || {});
-    const perRow = rowSeats(template);
-    if (!perRow) return { added: 0, short: count - seats, seats };
+    const perRow = rowHolds(template);
+    if (!rowSeats(template) || !perRow) return { added: 0, short: count - seats, seats };
 
     let added = 0;
     while (seats < count && layout.rowConfigs.length < 25) {
@@ -1575,10 +1715,66 @@ function interleaveCohorts(cohorts) {
     return out;
 }
 
-/* Seat filling: row by row (R1 nearest the board), column by column. */
-function assignSeats(students, layout, startDirection) {
+/* A layout is bench-based when every block of seats is an even number,
+   so the seats pair off cleanly into benches of two. */
+function isBenchLayout(layout) {
+    const sides = SIDE_ORDER[layout.layoutType] || SIDE_ORDER.auditorium;
+    let any = false;
+    for (const cfg of layout.rowConfigs) {
+        for (const side of sides) {
+            const n = Number(cfg[side]) || 0;
+            if (n === 0) continue;
+            if (n % 2 !== 0) return false;
+            any = true;
+        }
+    }
+    return any;
+}
+
+/* Deals students onto benches.
+
+   Single seating  : one student per bench, the other place left empty.
+   Double seating  : two students per bench, and when the room holds more
+                     than one subject the two are always sitting different
+                     papers. Any surplus from the larger subject takes a
+                     bench on its own rather than sitting beside its own
+                     subject.
+
+   `groups` is one entry per subject. Returns a flat seat sequence where
+   each consecutive pair is one bench; "" marks an empty place. */
+function benchPlan(groups, density) {
+    const queues = groups.map((g) => g.slice()).filter((q) => q.length);
+    const seq = [];
+
+    if (density === "single") {
+        for (const q of queues) for (const roll of q) seq.push(roll, "");
+        return seq;
+    }
+
+    if (queues.length < 2) {                       // one subject, full occupancy
+        for (const roll of queues.flat()) seq.push(roll);
+        return seq;
+    }
+
+    // always draw the next two from the two largest different subjects
+    while (queues.some((q) => q.length)) {
+        queues.sort((a, b) => b.length - a.length);
+        const first = queues[0].shift();
+        const second = (queues[1] && queues[1].length) ? queues[1].shift() : "";
+        seq.push(first, second);
+        for (let i = queues.length - 1; i >= 0; i--) if (!queues[i].length) queues.splice(i, 1);
+    }
+    return seq;
+}
+
+/* Seat filling: row by row (R1 nearest the board), column by column.
+   Under single seating every other seat in a block is left empty, so no
+   two students sit side by side. */
+function assignSeats(students, layout, startDirection, density, seatSeq) {
     const sides = (SIDE_ORDER[layout.layoutType] || SIDE_ORDER.auditorium).slice();
     if (startDirection === "right") sides.reverse();
+    const single = density === "single";
+    const seq = Array.isArray(seatSeq) ? seatSeq : null;   // bench plan, blanks included
 
     let i = 0;
     return layout.rowConfigs.map((cfg) => {
@@ -1586,7 +1782,11 @@ function assignSeats(students, layout, startDirection) {
         sides.forEach((side) => { row[side] = []; });
         for (const side of sides) {
             const n = Number(cfg[side]) || 0;
-            for (let s = 0; s < n; s++) row[side].push(i < students.length ? students[i++] : "");
+            for (let s = 0; s < n; s++) {
+                if (seq) { row[side].push(i < seq.length ? (seq[i++] || "") : ""); continue; }
+                const takes = single ? (s % 2 === 0) : true;
+                row[side].push(takes && i < students.length ? students[i++] : "");
+            }
         }
         if (startDirection === "right") sides.forEach((side) => row[side].reverse());
         return row;
@@ -1629,6 +1829,8 @@ function generateAll() {
         const programmes = [], subjects = [], ranges = [], sems = [], cohorts = [];
         let stated = 0;
 
+        let droppedProgramme = 0, droppedSubject = 0, blankRangeRows = 0;
+
         for (const row of g.rows) {
             const prog = String(pick(row, ["Prog. Name & Stream", "Programme", "Prog Name", "Program"])).trim();
             const subj = titleCaseSubject(pick(row, ["Subject", "Subjects"]));
@@ -1639,39 +1841,133 @@ function generateAll() {
             if (prog && !programmes.includes(prog)) programmes.push(prog);
             if (subj && !subjects.includes(subj)) subjects.push(subj);
             if (rangeStr && !ranges.includes(rangeStr)) ranges.push(rangeStr);
-            if (sem && sem !== "—" && !sems.includes(sem)) sems.push(sem);
-            if (!isNaN(cnt)) stated += cnt;
+            if (sem && sem !== "\u2014" && !sems.includes(sem)) sems.push(sem);
 
+            // no usable roll number range -> the row is not seated at all
             const parsed = parseRollRange(rangeStr);
-            cohorts.push(parsed.length ? studentsForAllocation(row, parsed) : []);
+            if (!parsed.length) {
+                blankRangeRows++;
+                cohorts.push({ subject: subj, rolls: [] });
+                continue;
+            }
+
+            if (!isNaN(cnt)) stated += cnt;
+            const found = studentsForAllocation(row, parsed);
+            droppedProgramme += found.droppedProgramme;
+            droppedSubject += found.droppedSubject;
+            cohorts.push({ subject: subj, rolls: found.rolls });
         }
 
-        // de-duplicate across cohorts while keeping cohort structure
+        // a roll number is seated once, in the first allocation that claims it
         const seen = new Set();
-        const cleanCohorts = cohorts.map((c) => c.filter((r) => !seen.has(r) && seen.add(r)));
-        const students = state.interleaveBatches
-            ? interleaveCohorts(cleanCohorts)
-            : cleanCohorts.flat();
+        const cleanCohorts = cohorts.map((c) => ({
+            subject: c.subject,
+            rolls: c.rolls.filter((r) => !seen.has(r) && seen.add(r))
+        }));
 
+        /* Order of seating. With more than one subject in the room the
+           subjects are dealt round-robin, so no two neighbours sit the
+           same paper. */
+        const bySubject = new Map();
+        for (const c of cleanCohorts) {
+            const key = c.subject || "";
+            if (!bySubject.has(key)) bySubject.set(key, []);
+            bySubject.get(key).push(...c.rolls);
+        }
+        const subjectGroups = [...bySubject.values()].filter((g2) => g2.length);
+        const students = subjectGroups.length > 1
+            ? interleaveCohorts(subjectGroups)
+            : (state.interleaveBatches
+                ? interleaveCohorts(cleanCohorts.map((c) => c.rolls))
+                : cleanCohorts.flatMap((c) => c.rolls));
+
+        /* Seating density. One subject in the room means single seating —
+           alternate seats left empty — but only where the cohort actually
+           fits that way; otherwise the room is filled normally and the
+           report says so. */
         const layout = getRoomLayout(g.room, students.length);
         const savedSeats = countSeats(layout);
-        const fit = fitLayoutToStudents(layout, students.length);
-        const seats = fit.seats;
+        const singleCapacity = usableSeats(layout, "single");
+        const wantsSingle = subjects.length <= 1;
+        const density = (wantsSingle && students.length <= singleCapacity) ? "single" : "double";
 
-        const warnings = [], notes = [];
+        /* On a bench room the places are dealt bench by bench, so that a
+           shared bench never holds two students sitting the same paper. */
+        const benchRoom = isBenchLayout(layout);
+        let seatSeq = null, benchesNeeded = 0, loneBenches = 0;
+        if (benchRoom) {
+            seatSeq = benchPlan(subjectGroups, density);
+            benchesNeeded = Math.ceil(seatSeq.length / 2);
+            for (let i = 1; i < seatSeq.length; i += 2) if (!seatSeq[i]) loneBenches++;
+        }
+
+        /* On a bench room the limit is benches, not seats: two students
+           who sit the same paper may not share one. */
+        const fit = benchRoom
+            ? fitLayoutToStudents(layout, benchesNeeded, "single")
+            : fitLayoutToStudents(layout, students.length, density);
+        const seats = benchRoom ? countSeats(layout) : fit.seats;
+        const benchesAvailable = benchRoom ? usableSeats(layout, "single") : 0;
+
+        const errors = [], warnings = [], notes = [];
+
+        if (blankRangeRows) {
+            errors.push(`${blankRangeRows} allocation row(s) for this room have no Roll No. Range `
+                + `in the seating plan and were not seated.`);
+        }
         if (students.length === 0) {
-            warnings.push("No students matched the roll list for this allocation — check the roll number range.");
+            errors.push("No students matched the roll call file for this room — "
+                + "check the roll number range and programme name.");
+        }
+        if (droppedProgramme) {
+            errors.push(`${droppedProgramme} roll number(s) inside the stated range belong to a `
+                + `different programme and were not seated.`);
+        }
+        if (benchRoom && layout.benchTarget && benchesNeeded > layout.benchTarget) {
+            errors.push(`Room capacity exceeded \u2014 ${students.length} students need `
+                + `${benchesNeeded} benches in ${g.room}, which has ${layout.benchTarget}.`);
+        } else if (!benchRoom && students.length > savedSeats) {
+            errors.push(`Room capacity exceeded \u2014 ${students.length} students allotted to `
+                + `${g.room}, which has ${savedSeats} seats.`);
         }
         if (fit.short > 0) {
-            warnings.push(`${fit.short} student(s) could not be seated — this room needs a larger layout.`);
+            errors.push(`${fit.short} student(s) could not be seated even after extending the layout.`);
+        }
+
+        if (droppedSubject) {
+            notes.push(`${droppedSubject} roll number(s) in the range are registered for a different `
+                + `subject and were not seated.`);
+        }
+        if (density === "single") {
+            notes.push(`Single seating: one subject in this room, so alternate seats are left empty.`);
+        } else if (wantsSingle) {
+            notes.push(`Single seating would need ${students.length * 2 - 1} seats; `
+                + `${g.room} holds ${savedSeats}, so the room is filled at full occupancy.`);
+        } else if (subjectGroups.length > 1) {
+            notes.push(`Double seating: ${subjectGroups.length} subjects in this room, dealt `
+                + `alternately so neighbours sit different papers.`);
         }
         if (fit.added > 0) {
-            notes.push(`Saved layout holds ${savedSeats} seats for ${students.length} students; `
-                + `${fit.added} extra row(s) added so everyone is seated.`);
+            notes.push(`Saved layout holds ${savedSeats} seats; ${fit.added} extra row(s) were added `
+                + `so every student has a seat.`);
+        }
+        if (benchRoom && density === "double" && subjectGroups.length > 1) {
+            notes.push(`Bench sharing: ${benchesNeeded} of ${benchesAvailable} benches used, `
+                + `every shared bench holding two different subjects.`);
+        }
+        if (loneBenches > 0 && density === "double") {
+            notes.push(`${loneBenches} bench(es) seat one student only \u2014 the subject counts are `
+                + `uneven, so the surplus is not paired with its own subject.`);
+        }
+        if (layout.benchRebuilt) {
+            notes.push(`${g.room} is a flat bench room with ${layout.benchTarget} benches on the `
+                + `official list`
+                + (layout.benchWas ? `, but the saved layout had ${layout.benchWas}` : ``)
+                + `. The rows were rebuilt to the official count \u2014 please confirm the row split.`);
         }
         if (stated && stated !== students.length) {
-            notes.push(`Seating plan states ${stated} students; the roll list gives ${students.length}. `
-                + `The roll list has been used.`);
+            notes.push(`Seating plan states ${stated} students; the roll call file gives `
+                + `${students.length}. The roll call file has been used.`);
         }
         if (layout.isFallback) notes.push(`No saved layout for ${g.room} — a standard layout was applied.`);
 
@@ -1697,8 +1993,9 @@ function generateAll() {
             students,
             statedCount: stated,
             layout, seats,
-            assigned: assignSeats(students, layout, state.startDirection),
-            warnings, notes
+            assigned: assignSeats(students, layout, state.startDirection, density, seatSeq),
+            density, savedSeats, subjectGroups, benchRoom,
+            errors, warnings, notes
         });
     }
 
@@ -1733,13 +2030,14 @@ function generateAll() {
     applyFilter();
     openReportView();
 
-    const flagged = sessions.filter((s) => s.warnings.length).length;
-    const noted = sessions.filter((s) => !s.warnings.length && s.notes.length).length;
+    const errored = sessions.filter((s) => s.errors.length).length;
+    const single = sessions.filter((s) => s.density === "single").length;
     setStatus(`${sessions.length} reports generated across `
-        + `${new Set(sessions.map((s) => s.dateKey)).size} exam dates.`
-        + (flagged ? ` ${flagged} need attention.` : "")
-        + (noted ? ` ${noted} carry a note.` : "")
-        + (skipped ? ` ${skipped} row(s) had no room number.` : ""));
+        + `${new Set(sessions.map((s) => s.dateKey)).size} exam dates. `
+        + `${single} use single seating, ${sessions.length - single} double.`
+        + (errored ? ` ${errored} report(s) carry an error \u2014 see the red band on the sheet.` : "")
+        + (skipped ? ` ${skipped} row(s) had no room number.` : ""),
+        errored > 0);
 }
 
 /* ─── Session navigation ─────────────────────────────────────────── */
@@ -1818,7 +2116,7 @@ function buildSessionSelect() {
     if (!sel) return;
     sel.innerHTML = state.view.map((i) => {
         const s = state.sessions[i];
-        const flag = s.warnings.length ? " *" : "";
+        const flag = s.errors.length ? "  \u25cf ERROR" : (s.warnings.length ? " *" : "");
         return `<option value="${i}" ${i === state.current ? "selected" : ""}>`
             + `${escapeHtml(s.room)} — ${escapeHtml(s.dateShort)} — ${escapeHtml(s.subjects.join(", ") || "—")}${flag}</option>`;
     }).join("");
@@ -1912,6 +2210,62 @@ function goBack() {
     document.body.classList.remove("has-report");
 }
 
+/* ─── Saved room layouts ──────────────────────────────────────────
+   Manual layout corrections are kept in this browser, and can be
+   exported to a file so the same corrections can be loaded on another
+   machine or committed alongside the portal.
+   ----------------------------------------------------------------- */
+const LAYOUT_STORE_KEY = "nmims.roomLayouts.v1";
+
+function loadSavedLayouts() {
+    try {
+        const raw = localStorage.getItem(LAYOUT_STORE_KEY);
+        if (!raw) return;
+        const data = JSON.parse(raw);
+        if (data && typeof data === "object") state.overrides = data;
+    } catch (e) { /* private mode or file:// — overrides stay session-only */ }
+}
+
+function saveLayouts() {
+    try {
+        localStorage.setItem(LAYOUT_STORE_KEY, JSON.stringify(state.overrides));
+        return true;
+    } catch (e) { return false; }
+}
+
+function exportLayouts() {
+    const rooms = Object.keys(state.overrides);
+    if (!rooms.length) {
+        setStatus("There are no manual layout changes to export yet.", true);
+        return;
+    }
+    const blob = new Blob([JSON.stringify(state.overrides, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "NMIMS_room_layouts.json";
+    a.click();
+    URL.revokeObjectURL(a.href);
+    setStatus(`Exported manual layouts for ${rooms.length} room(s).`);
+}
+
+function importLayouts(file) {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+        try {
+            const data = JSON.parse(e.target.result);
+            if (!data || typeof data !== "object") throw new Error("unexpected contents");
+            Object.assign(state.overrides, data);
+            saveLayouts();
+            const n = Object.keys(data).length;
+            if (state.sessions.length) generateAll();
+            setStatus(`Loaded manual layouts for ${n} room(s).`);
+        } catch (err) {
+            setStatus("That layout file could not be read: " + err.message, true);
+        }
+    };
+    reader.readAsText(file);
+}
+
 /* ─── Sidebar (optional layout override) ─────────────────────────── */
 function bindSidebarControls() {
     const ay = $("academicYear");
@@ -1966,9 +2320,20 @@ function bindSidebarControls() {
         const s = state.sessions[state.current];
         if (!s) return;
         delete state.overrides[s.room];
+        saveLayouts();
         rebuildSession(state.current);
         renderRowConfigEditor(state.sessions[state.current].layout);
         setStatus(`Layout for ${s.room} reset to the saved default.`);
+    });
+
+    const exportBtn = $("exportLayoutBtn");
+    if (exportBtn) exportBtn.addEventListener("click", exportLayouts);
+
+    const importInput = $("importLayoutInput");
+    if (importInput) importInput.addEventListener("change", (e) => {
+        const f = e.target.files[0];
+        if (f) importLayouts(f);
+        e.target.value = "";
     });
 
     const toggle = $("toggleConfigBtn");
@@ -2003,28 +2368,60 @@ function applyLayoutOverride() {
         rowConfigs: draft.rowConfigs,
         alternateSeating: !!draft.alternateSeating
     };
+    const kept = saveLayouts();
     // every session in this room follows the override
     state.sessions.forEach((sess, i) => { if (sess.room === s.room) rebuildSession(i); });
-    setStatus(`Layout override applied to every report for ${s.room}.`);
+    setStatus(`Layout applied to every report for ${s.room}.`
+        + (kept ? " It will be remembered on this computer." : ""));
 }
 
 function rebuildSession(index) {
     const s = state.sessions[index];
     if (!s) return;
     s.layout = getRoomLayout(s.room, s.students.length);
-    const savedSeats = countSeats(s.layout);
-    const fit = fitLayoutToStudents(s.layout, s.students.length);
-    s.seats = fit.seats;
-    s.assigned = assignSeats(s.students, s.layout, state.startDirection);
-    s.warnings = s.warnings.filter((w) => !/could not be seated/.test(w));
-    s.notes = s.notes.filter((n) => !/extra row|standard layout/.test(n));
+    s.savedSeats = countSeats(s.layout);
+
+    // the density rule is re-evaluated against the new layout
+    const wantsSingle = s.subjects.length <= 1;
+    s.density = (wantsSingle && s.students.length <= usableSeats(s.layout, "single"))
+        ? "single" : "double";
+
+    const benchRoom = isBenchLayout(s.layout);
+    s.benchRoom = benchRoom;
+    let seatSeq = null, benchesNeeded = 0;
+    if (benchRoom) {
+        seatSeq = benchPlan(s.subjectGroups || [s.students], s.density);
+        benchesNeeded = Math.ceil(seatSeq.length / 2);
+    }
+    const fit = benchRoom
+        ? fitLayoutToStudents(s.layout, benchesNeeded, "single")
+        : fitLayoutToStudents(s.layout, s.students.length, s.density);
+    s.seats = benchRoom ? countSeats(s.layout) : fit.seats;
+    s.assigned = assignSeats(s.students, s.layout, state.startDirection, s.density, seatSeq);
+
+    const drop = (list, re) => list.filter((t) => !re.test(t));
+    s.errors = drop(s.errors, /could not be seated even|Room capacity exceeded/);
+    s.notes = drop(s.notes, /extra row|standard layout|Single seating|Double seating|full occupancy/);
+
+    if (s.students.length > s.savedSeats) {
+        s.errors.push(`Room capacity exceeded \u2014 ${s.students.length} students allotted to `
+            + `${s.room}, which has ${s.savedSeats} seats.`);
+    }
     if (fit.short > 0) {
-        s.warnings.push(`${fit.short} student(s) could not be seated — this room needs a larger layout.`);
+        s.errors.push(`${fit.short} student(s) could not be seated even after extending the layout.`);
+    }
+    if (s.density === "single") {
+        s.notes.push("Single seating: one subject in this room, so alternate seats are left empty.");
+    } else if (wantsSingle) {
+        s.notes.push(`Single seating would need ${s.students.length * 2 - 1} seats; `
+            + `${s.room} holds ${s.savedSeats}, so the room is filled at full occupancy.`);
     }
     if (fit.added > 0) {
-        s.notes.push(`Saved layout holds ${savedSeats} seats for ${s.students.length} students; `
-            + `${fit.added} extra row(s) added so everyone is seated.`);
+        s.notes.push(`Saved layout holds ${s.savedSeats} seats; ${fit.added} extra row(s) were added `
+            + `so every student has a seat.`);
     }
+    if (s.layout.isFallback) s.notes.push(`No saved layout for ${s.room} — a standard layout was applied.`);
+
     state.allRendered = false;
     if (index === state.current) renderReport(s);
 }
@@ -2091,7 +2488,7 @@ const PRINT_BUDGET = {
     /* planH = millimetres of sheet height the seat rows may occupy
        planW = millimetres of sheet width available to a row of seats  */
     sidebyside: { planH: 117, planW: 180, seatHMax: 22, seatWMax: 28, seatFsMax: 20, tallyFs: 11 },
-    stacked:    { planH: 97,  planW: 276, seatHMax: 15, seatWMax: 30, seatFsMax: 16, tallyFs: 7 },
+    stacked:    { planH: 92,  planW: 276, seatHMax: 15, seatWMax: 30, seatFsMax: 16, tallyFs: 7 },
     full:       { planH: 130, planW: 276, seatHMax: 22, seatWMax: 30, seatFsMax: 20, tallyFs: 11.5 }
 };
 const SCALE_FACTOR = { sm: 0.82, md: 0.91, lg: 1, xl: 1.1 };
@@ -2107,9 +2504,12 @@ function printMetrics(session, mode, scale) {
     const blocks = Math.max(1, sides.filter((x) => cfgs.some((c) => (Number(c[x]) || 0) > 0)).length);
 
     const clamp = (lo, v, hi) => Math.max(lo, Math.min(v, hi));
-    // vertical: rows share the plan height, allowing 1.3mm between rows
+    /* an error band printed above the plan takes height away from it */
+    const nErr = (session.errors || []).length;
+    const planH = b.planH - (nErr === 0 ? 0 : (nErr === 1 ? 9 : 17));
+    // vertical: rows share the plan height, allowing 1.9mm between rows
     const ROW_GAP = 1.9;                       // matches .seating-row margin in print
-    const h = clamp(4.5, Math.min(b.planH / rows - ROW_GAP, b.seatHMax * k), b.seatHMax * k);
+    const h = clamp(4.5, Math.min(planH / rows - ROW_GAP, b.seatHMax * k), b.seatHMax * k);
     // horizontal: seats share the width, minus aisles (6mm) and the row label (12mm)
     const w = clamp(10, Math.min((b.planW - (blocks - 1) * 6 - 12) / maxSeats - 1, b.seatWMax * k), b.seatWMax * k);
     // a 5-character roll number must fit inside the box
@@ -2158,9 +2558,12 @@ function renderReport(session) {
     $("statOccupancy").textContent = session.seats ? occ + "%" : "—";
 
     const warn = $("warningBar");
-    const items = session.warnings.map((w) => `<div class="warn-item">${escapeHtml(w)}</div>`)
+    const errs = session.errors || [];
+    const items = errs.map((e) => `<div class="err-item">${escapeHtml(e)}</div>`)
+        .concat(session.warnings.map((w) => `<div class="warn-item">${escapeHtml(w)}</div>`))
         .concat(session.notes.map((n) => `<div class="note-item">${escapeHtml(n)}</div>`));
-    warn.className = "warning-bar no-print" + (session.warnings.length ? " is-warning" : " is-note");
+    warn.className = "warning-bar no-print"
+        + (errs.length ? " is-error" : (session.warnings.length ? " is-warning" : " is-note"));
     warn.style.display = items.length ? "block" : "none";
     warn.innerHTML = items.join("");
 
@@ -2182,6 +2585,11 @@ function buildSessionNode(session, opts = {}) {
         ["Session Time", session.time],
         ["Semester", session.sems.join(", ") || "—"],
         ["Students", String(session.students.length)],
+        ["Seating", session.density === "single"
+            ? "Single \u2014 one student per bench"
+            : (session.subjects.length > 1
+                ? "Double \u2014 different subjects share a bench"
+                : "Double \u2014 full occupancy")],
         ["Programme(s)", session.programmes.join("  •  ") || "—"],
         ["Subject(s)", session.subjects.join("  •  ") || "—"],
         ["Roll No. Range", session.rollRanges.join(",  ") || "—"],
@@ -2198,6 +2606,12 @@ function buildSessionNode(session, opts = {}) {
               <span class="mb-value">${escapeHtml(v)}</span>
             </span>`).join("")}
         </div>
+
+        ${(session.errors && session.errors.length) ? `
+        <div class="error-band">
+          <span class="error-tag">Error</span>
+          <span class="error-list">${session.errors.map(escapeHtml).join(" &nbsp;\u2022&nbsp; ")}</span>
+        </div>` : ""}
 
         <div class="seating-plan-area">
           <div class="seating-plan-head">
@@ -2319,10 +2733,12 @@ function headerBand(session, docType, pageLabel) {
     return `
       <header class="report-header-band">
         <div class="report-header-brand">
-          <div class="crest">MPSTME</div>
-          <div>
-            <div class="inst-name">SVKM's NMIMS</div>
-            <div class="inst-tagline">Narsee Monjee Institute of Management Studies &middot; Deemed to be University</div>
+          ${INSTITUTE.logo
+            ? `<div class="crest has-logo"><img src="${escapeHtml(INSTITUTE.logo)}" alt=""></div>`
+            : (INSTITUTE.crest ? `<div class="crest">${escapeHtml(INSTITUTE.crest)}</div>` : "")}
+          <div class="brand-lines">
+            <div class="inst-name">${escapeHtml(INSTITUTE.name)}</div>
+            <div class="inst-tagline">${escapeHtml(INSTITUTE.tagline)}</div>
             <div class="doc-type">${escapeHtml(docType)}</div>
           </div>
         </div>
