@@ -87,6 +87,17 @@
           <button id="applyLayoutBtn" class="btn btn-navy btn-sm">Apply to this room</button>
           <button id="resetLayoutBtn" class="btn btn-outline btn-sm">Reset</button>
         </div>
+        <p class="sidebar-hint" style="margin-top:14px;">
+          Changes are remembered on this computer. Export them to reuse the
+          same corrected layouts elsewhere.
+        </p>
+        <div class="sidebar-actions">
+          <button id="exportLayoutBtn" class="btn btn-outline btn-sm">Export layouts</button>
+          <label class="btn btn-outline btn-sm" style="text-align:center; cursor:pointer;">
+            Import
+            <input type="file" accept=".json" id="importLayoutInput" style="display:none;" />
+          </label>
+        </div>
       </div>
     </aside>
 
