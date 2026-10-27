@@ -1016,8 +1016,38 @@ const uploadView = () => document.getElementById("uploadView");
 const reportView = () => document.getElementById("reportView");
 const $ = (id) => document.getElementById(id);
 
+/* ─── Label colour on the printed report ──────────────────────────
+   The small labels on the report — ACADEMIC YEAR, EXAM DATE and the
+   rest — were a light grey that does not come out well on a printer.
+   These rules darken them. They live here so the portal needs only
+   script.js updating; move them into style.css whenever convenient.
+   ----------------------------------------------------------------- */
+const REPORT_LABEL_CSS = `
+  .mb-label, .ts-label, .acc-f-label, .sig-meta, .sig-meta span {
+      color: #262320 !important;
+      font-weight: 700 !important;
+  }
+  .acc-cap, .section-heading, .sig-label { color: #10234b !important; }
+  @media print {
+      .mb-label, .ts-label, .acc-f-label, .sig-meta, .sig-meta span {
+          color: #000 !important;
+          font-weight: 700 !important;
+      }
+      .acc-cap, .section-heading, .sig-label { color: #10234b !important; }
+  }
+`;
+
+function applyReportLabelStyle() {
+    if (document.getElementById("reportLabelStyle")) return;
+    const el = document.createElement("style");
+    el.id = "reportLabelStyle";
+    el.textContent = REPORT_LABEL_CSS;
+    document.head.appendChild(el);
+}
+
 /* ─── Init ───────────────────────────────────────────────────────── */
 document.addEventListener("DOMContentLoaded", () => {
+    applyReportLabelStyle();
     loadSavedLayouts();
     bindUploadCards();
     bindSidebarControls();
@@ -1337,36 +1367,63 @@ async function readXlsx(buffer) {
     const shared = [];
     const sstXml = await zipText(files, "xl/sharedStrings.xml");
     if (sstXml) {
-        parseXml(sstXml).querySelectorAll("sst > si").forEach((si) => {
-            const t = si.querySelector(":scope > t");
-            if (t) { shared.push(t.textContent); return; }
+        const sst = parseXml(sstXml).documentElement;
+        const items = sst ? sst.children : [];
+        for (let i = 0; i < items.length; i++) {
+            const si = items[i];
+            if (si.tagName !== "si") continue;
             let out = "";
-            si.querySelectorAll("r > t").forEach((x) => { out += x.textContent; });
+            const kids = si.children;
+            for (let k = 0; k < kids.length; k++) {
+                const kid = kids[k];
+                if (kid.tagName === "t") out += kid.textContent;
+                else if (kid.tagName === "r") {
+                    const ts = kid.getElementsByTagName("t");
+                    for (let n = 0; n < ts.length; n++) out += ts[n].textContent;
+                }
+            }
             shared.push(out);
-        });
+        }
     }
 
     const dateFmt = dateStyles(await zipText(files, "xl/styles.xml"));
 
     // cells -> a grid
     const grid = [];
-    parseXml(sheetXml).querySelectorAll("sheetData > row").forEach((row) => {
+    /* Walking the DOM children directly rather than running a selector per
+       cell: a 58,000-row roll call has a third of a million cells, and
+       querySelector on each one is far too slow. */
+    const sheetDoc = parseXml(sheetXml);
+    const sheetData = sheetDoc.getElementsByTagName("sheetData")[0];
+    const rowEls = sheetData ? sheetData.children : [];
+
+    for (let ri = 0; ri < rowEls.length; ri++) {
+        const row = rowEls[ri];
+        if (row.tagName !== "row") continue;
         const rowIdx = parseInt(row.getAttribute("r"), 10) - 1;
         const cells = [];
         let auto = 0;
-        row.querySelectorAll("c").forEach((c) => {
+
+        const cellEls = row.children;
+        for (let ci2 = 0; ci2 < cellEls.length; ci2++) {
+            const c = cellEls[ci2];
+            if (c.tagName !== "c") continue;
             const ref = c.getAttribute("r");
             const ci = ref ? colOf(ref) : auto;
             auto = ci + 1;
 
             const type = c.getAttribute("t");
             let value = "";
+
             if (type === "inlineStr") {
-                const t = c.querySelector("is t");
-                value = t ? t.textContent : "";
+                const is = c.getElementsByTagName("t")[0];
+                value = is ? is.textContent : "";
             } else {
-                const v = c.querySelector("v");
-                const raw = v ? v.textContent : "";
+                let raw = "";
+                const kids = c.children;
+                for (let k = 0; k < kids.length; k++) {
+                    if (kids[k].tagName === "v") { raw = kids[k].textContent; break; }
+                }
                 if (raw === "") value = "";
                 else if (type === "s") value = shared[parseInt(raw, 10)] ?? "";
                 else if (type === "str") value = raw;
@@ -1380,9 +1437,9 @@ async function readXlsx(buffer) {
                 }
             }
             cells[ci] = value;
-        });
+        }
         grid[isNaN(rowIdx) ? grid.length : rowIdx] = cells;
-    });
+    }
 
     // first non-empty row is the header
     const notEmpty = (r) => r && r.some((v) => v !== undefined && v !== "" && v !== null);
@@ -1496,51 +1553,186 @@ function rollInRanges(roll, ranges) {
         num >= r.start && num <= r.end && normalizeStr(prefix) === normalizeStr(r.prefix));
 }
 
+/* ─── Reading the roll call file ───────────────────────────────────
+   The roll call export and the seating plan are produced by different
+   offices and do not name their columns the same way, nor spell their
+   programmes the same way. These helpers reconcile the two.
+   ----------------------------------------------------------------- */
+const COL = {
+    roll:    /^roll(no|number)?$/,
+    subject: /^subject/,
+    prog:    /^prog/,                  // "Prog. Name & Stream" or "Program & Stream"
+    sem:     /^sem/
+};
+
+const colKey = (k) => String(k).toLowerCase().replace(/[^a-z0-9]/g, "");
+
+function pickBy(row, pattern, fallback = "") {
+    for (const key of Object.keys(row)) {
+        if (!pattern.test(colKey(key))) continue;
+        const v = row[key];
+        if (v !== undefined && v !== null && String(v).trim() !== "") return v;
+    }
+    return fallback;
+}
+
+function hasColumnBy(rows, pattern) {
+    return (rows || []).some((r) => String(pickBy(r, pattern)).trim() !== "");
+}
+
+/* "Semester III", "Sem III" and " III" all reduce to "iii". */
+function canonSemester(v) {
+    return String(v || "").toLowerCase()
+        .replace(/semester|sem\.?/g, "").replace(/[^a-z0-9]/g, "").trim();
+}
+
+/* The plan writes "MBA Tech DS"; the roll call writes "MASTER OF BUSINESS
+   ADMINISTRATION IN TECHNOLOGY MANAGEMENT (DATA SCIENCE)". Both reduce to
+   degree + stream, with six-year integrated programmes kept distinct. */
+const DEGREES = [
+    [/masterofbusinessadministration|mbatech|^mba/, "mbatech"],
+    [/masterofcomputerapplications|^mca/, "mca"],
+    [/masteroftechnology|^mtech/, "mtech"],
+    [/bacheloroftechnology|^btech/, "btech"],
+    [/diploma/, "diploma"]
+];
+const STREAMS = [
+    [/computerscienceandbusinesssystems|csbs/, "csbs"],
+    [/computerscienceandengineering.*cybersecurity|csecs/, "csecs"],
+    [/computerscienceandengineering.*datascience|cseds/, "cseds"],
+    [/computerscienceandengineering|compsciandeng/, "cse"],
+    [/artificialintelligence|(^|[^a-z])ai([^a-z]|$)/, "ai"],
+    [/datascience|(^|[^a-z])ds([^a-z]|$)/, "ds"],
+    [/informationtechnology|(^|[^a-z])it([^a-z]|$)/, "it"],
+    [/electronics.*telecommunication|extc/, "extc"],
+    [/mechatronics|mxtc/, "mxtc"],
+    [/mechanical|mecheng|(^|[^a-z])mech([^a-z]|$)/, "mech"],
+    [/civil/, "civil"],
+    [/computerengineering|compeng|computer/, "computer"]
+];
+
+/* Words that carry no stream information, removed so that a short code
+   like "B Tech AI" is left as just "ai". */
+const PROG_FILLER = /bacheloroftechnology|masterofbusinessadministrationintechnologymanagement|masteroftechnology|masterofcomputerapplications|btech|mbatech|mtech|mba|mca|diploma|sixyearsintegratedprogram|integratedprogram|integrated|intg|programme|program|engineering/g;
+
+/* Short codes, longest first so "cseds" wins over "cse". */
+const STREAM_CODES = [
+    ["compsciandeng", "cse"], ["csecs", "csecs"], ["cseds", "cseds"], ["csbs", "csbs"],
+    ["compeng", "computer"], ["computer", "computer"], ["cse", "cse"],
+    ["mecheng", "mech"], ["mech", "mech"], ["mxtc", "mxtc"], ["extc", "extc"],
+    ["civil", "civil"], ["ai", "ai"], ["ds", "ds"], ["it", "it"]
+];
+
+/* Both spellings are reduced to "degree:stream", with six-year
+   integrated programmes kept apart. "B Tech AI" and "BACHELOR OF
+   TECHNOLOGY (ARTIFICIAL INTELLIGENCE)" meet in the middle. */
+function canonProgramme(v) {
+    const flat = String(v || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (!flat) return "";
+    const degree = (DEGREES.find(([re]) => re.test(flat)) || [, ""])[1];
+    if (degree === "mca") return "mca:";                    // no stream to speak of
+
+    let stream = (STREAMS.find(([re]) => re.test(flat)) || [, ""])[1];
+    if (!stream) {                                          // a short code such as "B Tech AI"
+        const rest = flat.replace(PROG_FILLER, "").replace(/^in/, "");
+        const hit = STREAM_CODES.find(([code]) => rest.startsWith(code));
+        if (hit) stream = hit[1];
+    }
+    const integrated = /integrated|intg/.test(flat) ? "+i" : "";
+    return degree + ":" + stream + integrated;
+}
+
+/* The roll call runs to tens of thousands of rows and every allocation
+   searches it, so it is indexed once by roll-number prefix. */
+function rollIndex() {
+    if (state._rollIndex && state._rollIndexFor === state.rollData) return state._rollIndex;
+    const idx = new Map();
+    for (const st of state.rollData || []) {
+        const roll = String(pickBy(st, COL.roll)).trim();
+        const m = roll.match(/^([A-Za-z]+)\s*0*(\d+)$/);
+        if (!m) continue;
+        const key = m[1].toUpperCase();
+        if (!idx.has(key)) idx.set(key, []);
+        idx.get(key).push({
+            roll,
+            num: parseInt(m[2], 10),
+            subject: normalizeStr(pickBy(st, COL.subject)),
+            prog: canonProgramme(pickBy(st, COL.prog)),
+            sem: canonSemester(pickBy(st, COL.sem))
+        });
+    }
+    state._rollIndex = idx;
+    state._rollIndexFor = state.rollData;
+    return idx;
+}
+
+/* Roll numbers in order: letter prefix first, then the number. */
+function sortRolls(list) {
+    return list.slice().sort((a, b) => {
+        const pa = (a.match(/[A-Za-z]+/) || [""])[0], pb = (b.match(/[A-Za-z]+/) || [""])[0];
+        return pa === pb ? extractNum(a) - extractNum(b) : pa.localeCompare(pb);
+    });
+}
+
 /* Students for one allocation row. A roll number is seated only when it
-   actually appears in the roll call file AND belongs to that row's
-   programme and subject — anything else is left out and counted, so the
-   report can say why. */
+   appears in the roll call file for that subject and that semester, and
+   for that programme where the two files' programme names correspond. */
 function studentsForAllocation(metaRow, ranges) {
-    const SUBJ_KEYS = ["SUBJECT", "Subject", "Subjects"];
-    const PROG_KEYS = ["Prog. Name & Stream", "Programme", "Prog Name", "Program"];
-    const ROLL_KEYS = ["Roll Number", "Roll No.", "Roll No", "RollNumber"];
-
-    const wantSubject = normalizeStr(pick(metaRow, SUBJ_KEYS));
-    const wantProg = normalizeStr(pick(metaRow, PROG_KEYS));
     const data = state.rollData || [];
+    const wantSubject = normalizeStr(pick(metaRow, ["Subject", "Subjects"]));
+    const wantProg = canonProgramme(pickBy(metaRow, COL.prog));
+    const wantSem = canonSemester(pickBy(metaRow, COL.sem));
 
-    // a filter is only applied when the roll call file actually carries
-    // that column; otherwise there is nothing to match against
-    const hasColumn = (keys) => data.some((st) => String(pick(st, keys)).trim() !== "");
+    const hasSubjectCol = hasColumnBy(data, COL.subject);
+    const hasProgCol = hasColumnBy(data, COL.prog);
+    const hasSemCol = hasColumnBy(data, COL.sem);
 
-    const inRange = data.filter((st) => rollInRanges(pick(st, ROLL_KEYS), ranges));
+    const idx = rollIndex();
+    let rows = [];
+    for (const r of ranges) {
+        const bucket = idx.get(String(r.prefix).toUpperCase()) || [];
+        for (const st of bucket) if (st.num >= r.start && st.num <= r.end) rows.push(st);
+    }
+    const inRangeCount = rows.length;
 
-    let rows = inRange;
-    let droppedSubject = 0, droppedProgramme = 0;
+    let droppedSubject = 0, droppedSemester = 0, droppedProgramme = 0, progIgnored = false;
 
-    if (wantSubject && hasColumn(SUBJ_KEYS)) {
+    if (wantSubject && hasSubjectCol) {
         const before = rows.length;
-        rows = rows.filter((st) => normalizeStr(pick(st, SUBJ_KEYS)) === wantSubject);
+        rows = rows.filter((st) => st.subject === wantSubject);
         droppedSubject = before - rows.length;
     }
-    if (wantProg && hasColumn(PROG_KEYS)) {
+    // the semester is what separates two intakes sharing a roll range
+    if (wantSem && hasSemCol) {
         const before = rows.length;
-        rows = rows.filter((st) => normalizeStr(pick(st, PROG_KEYS)) === wantProg);
-        droppedProgramme = before - rows.length;
+        rows = rows.filter((st) => st.sem === wantSem);
+        droppedSemester = before - rows.length;
+    }
+    if (wantProg && hasProgCol) {
+        const kept = rows.filter((st) => st.prog === wantProg);
+        if (kept.length || !rows.length) {
+            droppedProgramme = rows.length - kept.length;
+            rows = kept;
+        } else {
+            // the two files name programmes differently; say so rather
+            // than seating nobody
+            progIgnored = true;
+        }
     }
 
     const rolls = [];
     const seen = new Set();
-    for (const st of rows) {
-        const roll = String(pick(st, ROLL_KEYS)).trim();
-        if (roll && !seen.has(roll)) { seen.add(roll); rolls.push(roll); }
-    }
+    for (const st of rows) if (!seen.has(st.roll)) { seen.add(st.roll); rolls.push(st.roll); }
     rolls.sort((a, b) => {
         const pa = (a.match(/[A-Za-z]+/) || [""])[0], pb = (b.match(/[A-Za-z]+/) || [""])[0];
         return pa === pb ? extractNum(a) - extractNum(b) : pa.localeCompare(pb);
     });
 
-    return { rolls, inRangeCount: inRange.length, droppedSubject, droppedProgramme };
+    return {
+        rolls, inRangeCount, droppedSubject, droppedSemester, droppedProgramme, progIgnored,
+        noSubjectColumn: !!wantSubject && !hasSubjectCol,
+        noProgrammeColumn: !!wantProg && !hasProgCol
+    };
 }
 
 /* ─── Room layout ────────────────────────────────────────────────── */
@@ -1731,6 +1923,25 @@ function isBenchLayout(layout) {
     return any;
 }
 
+/* The benches of a room, ordered the way they are filled: column by
+   column, and within a column from R1 (nearest the board) upwards. Rows
+   of different widths are handled, so a short front row is simply skipped
+   in the columns it does not reach. */
+function benchSlots(layout) {
+    const sides = SIDE_ORDER[layout.layoutType] || SIDE_ORDER.auditorium;
+    const pairsIn = (cfg, side) => Math.floor((Number(cfg[side]) || 0) / 2);
+    const slots = [];
+    for (const side of sides) {
+        const widest = layout.rowConfigs.reduce((m, cfg) => Math.max(m, pairsIn(cfg, side)), 0);
+        for (let pair = 0; pair < widest; pair++) {
+            for (let r = 0; r < layout.rowConfigs.length; r++) {
+                if (pairsIn(layout.rowConfigs[r], side) > pair) slots.push({ r, side, pair });
+            }
+        }
+    }
+    return slots;
+}
+
 /* Deals students onto benches.
 
    Single seating  : one student per bench, the other place left empty.
@@ -1742,29 +1953,41 @@ function isBenchLayout(layout) {
 
    `groups` is one entry per subject. Returns a flat seat sequence where
    each consecutive pair is one bench; "" marks an empty place. */
-function benchPlan(groups, density) {
-    const queues = groups.map((g) => g.slice()).filter((q) => q.length);
-    const seq = [];
+function benchPlan(groups, density, benchCount) {
+    const queues = groups.map((g) => g.slice()).filter((q) => q.length)
+        .sort((a, b) => b.length - a.length);          // largest subject first
+    const benches = Array.from({ length: Math.max(0, benchCount) }, () => ["", ""]);
+    if (!benches.length) return [];
 
-    if (density === "single") {
-        for (const q of queues) for (const roll of q) seq.push(roll, "");
-        return seq;
-    }
+    /* Pass 1 — every subject in turn takes a bench of its own, the
+       largest subject first, until the benches run out. */
+    const owner = [];                                   // subject sitting alone on each bench
+    const spare = [];
+    let b = 0;
+    queues.forEach((q, qi) => {
+        while (q.length && b < benches.length) {
+            benches[b][0] = q.shift();
+            owner[b] = qi;
+            b++;
+        }
+        if (q.length) spare.push({ qi, rolls: q });
+    });
 
-    if (queues.length < 2) {                       // one subject, full occupancy
-        for (const roll of queues.flat()) seq.push(roll);
-        return seq;
-    }
+    if (density === "single") return benches.flat();    // never share a bench
 
-    // always draw the next two from the two largest different subjects
-    while (queues.some((q) => q.length)) {
-        queues.sort((a, b) => b.length - a.length);
-        const first = queues[0].shift();
-        const second = (queues[1] && queues[1].length) ? queues[1].shift() : "";
-        seq.push(first, second);
-        for (let i = queues.length - 1; i >= 0; i--) if (!queues[i].length) queues.splice(i, 1);
+    /* Pass 2 — only now, with no empty bench left, students double up,
+       and always beside someone sitting a different paper. */
+    for (const lot of spare) {
+        for (const roll of lot.rolls) {
+            let at = benches.findIndex((bench, i) =>
+                bench[0] && !bench[1] && owner[i] !== undefined && owner[i] !== lot.qi);
+            if (at < 0) at = benches.findIndex((bench) => bench[0] && !bench[1]);
+            if (at < 0) at = benches.findIndex((bench) => !bench[0]);
+            if (at < 0) break;                          // room genuinely full
+            benches[at][benches[at][0] ? 1 : 0] = roll;
+        }
     }
-    return seq;
+    return benches.flat();
 }
 
 /* Seat filling: row by row (R1 nearest the board), column by column.
@@ -1776,6 +1999,23 @@ function assignSeats(students, layout, startDirection, density, seatSeq) {
     const single = density === "single";
     const seq = Array.isArray(seatSeq) ? seatSeq : null;   // bench plan, blanks included
 
+    /* A bench plan is laid out bench by bench, down each column in turn,
+       so the roll numbers read vertically up the room. */
+    if (seq) {
+        const rows = layout.rowConfigs.map((cfg) => {
+            const row = {};
+            sides.forEach((side) => { row[side] = new Array(Number(cfg[side]) || 0).fill(""); });
+            return row;
+        });
+        benchSlots(layout).forEach((slot, n) => {
+            const place = rows[slot.r][slot.side];
+            place[slot.pair * 2] = seq[n * 2] || "";
+            place[slot.pair * 2 + 1] = seq[n * 2 + 1] || "";
+        });
+        if (startDirection === "right") rows.forEach((row) => sides.forEach((side) => row[side].reverse()));
+        return rows;
+    }
+
     let i = 0;
     return layout.rowConfigs.map((cfg) => {
         const row = {};
@@ -1783,7 +2023,6 @@ function assignSeats(students, layout, startDirection, density, seatSeq) {
         for (const side of sides) {
             const n = Number(cfg[side]) || 0;
             for (let s = 0; s < n; s++) {
-                if (seq) { row[side].push(i < seq.length ? (seq[i++] || "") : ""); continue; }
                 const takes = single ? (s % 2 === 0) : true;
                 row[side].push(takes && i < students.length ? students[i++] : "");
             }
@@ -1830,6 +2069,8 @@ function generateAll() {
         let stated = 0;
 
         let droppedProgramme = 0, droppedSubject = 0, blankRangeRows = 0;
+        let missingSubjectColumn = false, missingProgrammeColumn = false;
+        let droppedSemester = 0, progNamesDiffer = false;
 
         for (const row of g.rows) {
             const prog = String(pick(row, ["Prog. Name & Stream", "Programme", "Prog Name", "Program"])).trim();
@@ -1855,6 +2096,10 @@ function generateAll() {
             const found = studentsForAllocation(row, parsed);
             droppedProgramme += found.droppedProgramme;
             droppedSubject += found.droppedSubject;
+            droppedSemester += found.droppedSemester;
+            if (found.progIgnored) progNamesDiffer = true;
+            if (found.noSubjectColumn) missingSubjectColumn = true;
+            if (found.noProgrammeColumn) missingProgrammeColumn = true;
             cohorts.push({ subject: subj, rolls: found.rolls });
         }
 
@@ -1891,23 +2136,30 @@ function generateAll() {
         const wantsSingle = subjects.length <= 1;
         const density = (wantsSingle && students.length <= singleCapacity) ? "single" : "double";
 
-        /* On a bench room the places are dealt bench by bench, so that a
-           shared bench never holds two students sitting the same paper. */
+        /* On a bench room the places are dealt bench by bench: every
+           student gets a bench to themselves while benches remain, and
+           only once they run out does anyone share — always with someone
+           sitting a different paper. */
         const benchRoom = isBenchLayout(layout);
-        let seatSeq = null, benchesNeeded = 0, loneBenches = 0;
+        let seatSeq = null, benchesTotal = 0, benchesUsed = 0, sharedBenches = 0, loneBenches = 0;
+        let fit;
+
         if (benchRoom) {
-            seatSeq = benchPlan(subjectGroups, density);
-            benchesNeeded = Math.ceil(seatSeq.length / 2);
-            for (let i = 1; i < seatSeq.length; i += 2) if (!seatSeq[i]) loneBenches++;
+            // the room must at least hold everyone two to a bench
+            fit = fitLayoutToStudents(layout, Math.ceil(students.length / 2), "single");
+            benchesTotal = usableSeats(layout, "single");
+            seatSeq = benchPlan(subjectGroups, density, benchesTotal);
+            for (let i = 0; i < seatSeq.length; i += 2) {
+                const one = seatSeq[i], two = seatSeq[i + 1];
+                if (one && two) { sharedBenches++; benchesUsed++; }
+                else if (one || two) { loneBenches++; benchesUsed++; }
+            }
+        } else {
+            fit = fitLayoutToStudents(layout, students.length, density);
         }
 
-        /* On a bench room the limit is benches, not seats: two students
-           who sit the same paper may not share one. */
-        const fit = benchRoom
-            ? fitLayoutToStudents(layout, benchesNeeded, "single")
-            : fitLayoutToStudents(layout, students.length, density);
         const seats = benchRoom ? countSeats(layout) : fit.seats;
-        const benchesAvailable = benchRoom ? usableSeats(layout, "single") : 0;
+        const benchesAvailable = benchesTotal;
 
         const errors = [], warnings = [], notes = [];
 
@@ -1919,13 +2171,21 @@ function generateAll() {
             errors.push("No students matched the roll call file for this room — "
                 + "check the roll number range and programme name.");
         }
+        if (missingSubjectColumn) {
+            errors.push("The roll call file has no SUBJECT column, so students could not be "
+                + "checked against the subject — everyone in the range was taken.");
+        }
+        if (missingProgrammeColumn) {
+            errors.push("The roll call file has no Prog. Name & Stream column, so students could "
+                + "not be checked against the programme — everyone in the range was taken.");
+        }
         if (droppedProgramme) {
             errors.push(`${droppedProgramme} roll number(s) inside the stated range belong to a `
                 + `different programme and were not seated.`);
         }
-        if (benchRoom && layout.benchTarget && benchesNeeded > layout.benchTarget) {
-            errors.push(`Room capacity exceeded \u2014 ${students.length} students need `
-                + `${benchesNeeded} benches in ${g.room}, which has ${layout.benchTarget}.`);
+        if (benchRoom && students.length > benchesAvailable * 2) {
+            errors.push(`Room capacity exceeded \u2014 ${students.length} students allotted to `
+                + `${g.room}, which has ${benchesAvailable} benches (${benchesAvailable * 2} places).`);
         } else if (!benchRoom && students.length > savedSeats) {
             errors.push(`Room capacity exceeded \u2014 ${students.length} students allotted to `
                 + `${g.room}, which has ${savedSeats} seats.`);
@@ -1934,15 +2194,26 @@ function generateAll() {
             errors.push(`${fit.short} student(s) could not be seated even after extending the layout.`);
         }
 
+        if (droppedSemester) {
+            notes.push(`${droppedSemester} student(s) in this roll number range are in a different `
+                + `semester and belong to another room.`);
+        }
+        if (progNamesDiffer) {
+            notes.push(`The roll call file spells programmes differently from the seating plan `
+                + `(e.g. "BACHELOR OF TECHNOLOGY (DATA SCIENCE)" against "B Tech DS"), so students `
+                + `were matched on roll range, subject and semester only.`);
+        }
         if (droppedSubject) {
-            notes.push(`${droppedSubject} roll number(s) in the range are registered for a different `
-                + `subject and were not seated.`);
+            notes.push(`${droppedSubject} registration row(s) in this roll number range belong to `
+                + `other subjects and were skipped (the roll call file lists one row per subject, `
+                + `so a student taking several papers appears several times).`);
         }
         if (density === "single") {
             notes.push(`Single seating: one subject in this room, so alternate seats are left empty.`);
         } else if (wantsSingle) {
-            notes.push(`Single seating would need ${students.length * 2 - 1} seats; `
-                + `${g.room} holds ${savedSeats}, so the room is filled at full occupancy.`);
+            notes.push(`Single seating needs one bench each: ${students.length} benches. `
+                + `${g.room} has ${benchRoom ? benchesAvailable : Math.floor(savedSeats / 2)}, `
+                + `so some benches are shared.`);
         } else if (subjectGroups.length > 1) {
             notes.push(`Double seating: ${subjectGroups.length} subjects in this room, dealt `
                 + `alternately so neighbours sit different papers.`);
@@ -1951,13 +2222,10 @@ function generateAll() {
             notes.push(`Saved layout holds ${savedSeats} seats; ${fit.added} extra row(s) were added `
                 + `so every student has a seat.`);
         }
-        if (benchRoom && density === "double" && subjectGroups.length > 1) {
-            notes.push(`Bench sharing: ${benchesNeeded} of ${benchesAvailable} benches used, `
-                + `every shared bench holding two different subjects.`);
-        }
-        if (loneBenches > 0 && density === "double") {
-            notes.push(`${loneBenches} bench(es) seat one student only \u2014 the subject counts are `
-                + `uneven, so the surplus is not paired with its own subject.`);
+        if (benchRoom && density === "double") {
+            notes.push(`Benches: ${benchesUsed} of ${benchesAvailable} in use \u2014 `
+                + `${loneBenches} with one student, ${sharedBenches} shared`
+                + (sharedBenches ? ` (each shared bench holds two different subjects).` : `.`));
         }
         if (layout.benchRebuilt) {
             notes.push(`${g.room} is a flat bench room with ${layout.benchTarget} benches on the `
@@ -1995,6 +2263,7 @@ function generateAll() {
             layout, seats,
             assigned: assignSeats(students, layout, state.startDirection, density, seatSeq),
             density, savedSeats, subjectGroups, benchRoom,
+            roster: sortRolls(students),       // attendance sheet order
             errors, warnings, notes
         });
     }
@@ -2388,14 +2657,13 @@ function rebuildSession(index) {
 
     const benchRoom = isBenchLayout(s.layout);
     s.benchRoom = benchRoom;
-    let seatSeq = null, benchesNeeded = 0;
+    let seatSeq = null, fit;
     if (benchRoom) {
-        seatSeq = benchPlan(s.subjectGroups || [s.students], s.density);
-        benchesNeeded = Math.ceil(seatSeq.length / 2);
+        fit = fitLayoutToStudents(s.layout, Math.ceil(s.students.length / 2), "single");
+        seatSeq = benchPlan(s.subjectGroups || [s.students], s.density, usableSeats(s.layout, "single"));
+    } else {
+        fit = fitLayoutToStudents(s.layout, s.students.length, s.density);
     }
-    const fit = benchRoom
-        ? fitLayoutToStudents(s.layout, benchesNeeded, "single")
-        : fitLayoutToStudents(s.layout, s.students.length, s.density);
     s.seats = benchRoom ? countSeats(s.layout) : fit.seats;
     s.assigned = assignSeats(s.students, s.layout, state.startDirection, s.density, seatSeq);
 
@@ -2614,9 +2882,6 @@ function buildSessionNode(session, opts = {}) {
         </div>` : ""}
 
         <div class="seating-plan-area">
-          <div class="seating-plan-head">
-            <span class="seating-plan-title">${planTitleFor(session.layout.layoutType)}</span>
-          </div>
           <div class="auditorium-wrapper">
             <div class="seating-grid ${gridClass(session.layout.layoutType)}"></div>
             <div class="board">Board / Stage</div>
@@ -2635,7 +2900,7 @@ function buildSessionNode(session, opts = {}) {
 
         <div class="tally-section">
           <div class="section-heading">Student Attendance &amp; Answer Book Signature Sheet</div>
-          <div class="tally-split">${tallyColumns(session.students.length)
+          <div class="tally-split">${tallyColumns((session.roster || session.students).length)
             .map(() => `
             <table class="tally-table">
               <thead>
@@ -2657,10 +2922,9 @@ function buildSessionNode(session, opts = {}) {
             ${accGroup("Supplements", ["Issued", "Used", "Unused"])}
             ${accGroup("Total", ["Present", "Absent"])}
           </div>
-          <div class="sig-grid">
+          <div class="sig-grid" style="grid-template-columns:repeat(2,1fr)">
             ${sigItem("Supervisor 1")}
             ${sigItem("Supervisor 2")}
-            ${sigItem("Exam Incharge")}
           </div>
       </section>`;
 
@@ -2670,16 +2934,17 @@ function buildSessionNode(session, opts = {}) {
 
     // tally rows, distributed down each column in turn
     const bodies = wrap.querySelectorAll(".tally-table tbody");
-    const slices = tallyColumns(session.students.length);
+    const roster = session.roster || session.students;
+    const slices = tallyColumns(roster.length);
     const row = (n, roll, spare) =>
         `<tr${spare ? ' class="spare"' : ""}><td class="center">${n}</td>`
         + `<td class="roll">${escapeHtml(roll)}</td><td class="supp center"></td></tr>`;
 
-    const n = session.students.length;
+    const n = roster.length;
     slices.forEach(([from, to], ci) => {
         let html = "";
         for (let i = from; i < to; i++) {
-            html += i < n ? row(i + 1, session.students[i], false)
+            html += i < n ? row(i + 1, roster[i], false)
                           : row(i + 1, "", true);        // spare line for late entries
         }
         bodies[ci].innerHTML = html;
