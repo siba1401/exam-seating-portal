@@ -1016,11 +1016,14 @@ const uploadView = () => document.getElementById("uploadView");
 const reportView = () => document.getElementById("reportView");
 const $ = (id) => document.getElementById(id);
 
-/* ─── Label colour on the printed report ──────────────────────────
-   The small labels on the report — ACADEMIC YEAR, EXAM DATE and the
-   rest — were a light grey that does not come out well on a printer.
-   These rules darken them. They live here so the portal needs only
-   script.js updating; move them into style.css whenever convenient.
+/* ─── Report tweaks that live in script.js ────────────────────────
+   Two things the stylesheet would normally carry:
+     - the small labels (ACADEMIC YEAR, EXAM DATE and the rest) were a
+       light grey that does not come out well on a printer;
+     - each signature sits on one line, "Supervisor 1 ________", so the
+       block takes a single line instead of three.
+   They live here so the portal needs only script.js updating; move
+   them into style.css whenever convenient.
    ----------------------------------------------------------------- */
 const REPORT_LABEL_CSS = `
   .mb-label, .ts-label, .acc-f-label, .sig-meta, .sig-meta span {
@@ -1028,12 +1031,34 @@ const REPORT_LABEL_CSS = `
       font-weight: 700 !important;
   }
   .acc-cap, .section-heading, .sig-label { color: #10234b !important; }
+
+  /* "Supervisor 1 ______________" on a single line */
+  .sig-item.sig-inline {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      min-width: 0;
+  }
+  .sig-item.sig-inline .sig-label {
+      flex: 0 0 auto;
+      margin-bottom: 0 !important;
+      white-space: nowrap;
+  }
+  .sig-item.sig-inline .sig-rule {
+      flex: 1 1 auto;
+      min-width: 25mm;
+      border-bottom: 1px solid #262320;
+      align-self: flex-end;
+  }
+
   @media print {
       .mb-label, .ts-label, .acc-f-label, .sig-meta, .sig-meta span {
           color: #000 !important;
           font-weight: 700 !important;
       }
       .acc-cap, .section-heading, .sig-label { color: #10234b !important; }
+      .sig-item.sig-inline { gap: 2.5mm !important; }
+      .sig-item.sig-inline .sig-rule { border-bottom: .7pt solid #000 !important; }
   }
 `;
 
@@ -3022,10 +3047,9 @@ function accGroup(title, fields) {
 }
 
 function sigItem(label) {
-    return `<div class="sig-item">
-        <div class="sig-label">${label}</div>
-        <div class="sig-name-line"></div>
-        <div class="sig-meta"><span>Name</span><span>Signature</span></div>
+    return `<div class="sig-item sig-inline">
+        <span class="sig-label">${label}</span>
+        <span class="sig-rule"></span>
       </div>`;
 }
 
