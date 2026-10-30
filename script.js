@@ -1032,6 +1032,16 @@ const REPORT_LABEL_CSS = `
   }
   .acc-cap, .section-heading, .sig-label { color: #10234b !important; }
 
+  /* (R) beside a roll number sitting a re-examination */
+  .seat-box.is-repeat { white-space: nowrap; }
+  .seat-re {
+      font-size: .60em;
+      font-weight: 700;
+      margin-left: .28em;
+      position: relative;
+      top: -.08em;
+  }
+
   /* "Supervisor 1 ______________" on a single line */
   .sig-item.sig-inline {
       display: flex;
@@ -1691,6 +1701,14 @@ function rollIndex() {
     return idx;
 }
 
+/* A subject written like "Calculus (Re 2024-2025)" is a re-examination,
+   and its students are marked (R) on the report. The bracket and the
+   word "Re" are both required, so a subject such as "(Research Methods)"
+   is not caught. */
+function isRepeatSubject(name) {
+    return /\(\s*re\b[^)]*\)/i.test(String(name || ""));
+}
+
 /* Roll numbers in order: letter prefix first, then the number. */
 function sortRolls(list) {
     return list.slice().sort((a, b) => {
@@ -2096,6 +2114,7 @@ function generateAll() {
         let droppedProgramme = 0, droppedSubject = 0, blankRangeRows = 0;
         let missingSubjectColumn = false, missingProgrammeColumn = false;
         let droppedSemester = 0, progNamesDiffer = false;
+        const repeatRolls = new Set();        // students sitting a re-examination
 
         for (const row of g.rows) {
             const prog = String(pick(row, ["Prog. Name & Stream", "Programme", "Prog Name", "Program"])).trim();
@@ -2119,6 +2138,9 @@ function generateAll() {
 
             if (!isNaN(cnt)) stated += cnt;
             const found = studentsForAllocation(row, parsed);
+            if (isRepeatSubject(pick(row, ["Subject", "Subjects"]))) {
+                found.rolls.forEach((r) => repeatRolls.add(r));
+            }
             droppedProgramme += found.droppedProgramme;
             droppedSubject += found.droppedSubject;
             droppedSemester += found.droppedSemester;
@@ -2135,9 +2157,11 @@ function generateAll() {
             rolls: c.rolls.filter((r) => !seen.has(r) && seen.add(r))
         }));
 
-        /* Order of seating. With more than one subject in the room the
-           subjects are dealt round-robin, so no two neighbours sit the
-           same paper. */
+        /* Order of seating. With more than one subject in the room each
+           subject keeps its own run of seats, the largest paper first, so
+           the roll numbers read in sequence — the same order the bench
+           rooms use. Ticking "Interleave programmes" goes back to dealing
+           the subjects alternately. */
         const bySubject = new Map();
         for (const c of cleanCohorts) {
             const key = c.subject || "";
@@ -2146,7 +2170,9 @@ function generateAll() {
         }
         const subjectGroups = [...bySubject.values()].filter((g2) => g2.length);
         const students = subjectGroups.length > 1
-            ? interleaveCohorts(subjectGroups)
+            ? (state.interleaveBatches
+                ? interleaveCohorts(subjectGroups)
+                : subjectGroups.slice().sort((a, b) => b.length - a.length).flat())
             : (state.interleaveBatches
                 ? interleaveCohorts(cleanCohorts.map((c) => c.rolls))
                 : cleanCohorts.flatMap((c) => c.rolls));
@@ -2240,8 +2266,11 @@ function generateAll() {
                 + `${g.room} has ${benchRoom ? benchesAvailable : Math.floor(savedSeats / 2)}, `
                 + `so some benches are shared.`);
         } else if (subjectGroups.length > 1) {
-            notes.push(`Double seating: ${subjectGroups.length} subjects in this room, dealt `
-                + `alternately so neighbours sit different papers.`);
+            notes.push(`Double seating: ${subjectGroups.length} subjects in this room. `
+                + (state.interleaveBatches
+                    ? `Dealt alternately so neighbours sit different papers.`
+                    : `Each subject keeps its own run of seats, the largest paper first, `
+                      + `so the roll numbers read in sequence.`));
         }
         if (fit.added > 0) {
             notes.push(`Saved layout holds ${savedSeats} seats; ${fit.added} extra row(s) were added `
@@ -2289,6 +2318,7 @@ function generateAll() {
             assigned: assignSeats(students, layout, state.startDirection, density, seatSeq),
             density, savedSeats, subjectGroups, benchRoom,
             roster: sortRolls(students),       // attendance sheet order
+            repeatRolls,                       // marked (R) on the report
             errors, warnings, notes
         });
     }
@@ -2961,9 +2991,12 @@ function buildSessionNode(session, opts = {}) {
     const bodies = wrap.querySelectorAll(".tally-table tbody");
     const roster = session.roster || session.students;
     const slices = tallyColumns(roster.length);
+    const repeats = session.repeatRolls;
     const row = (n, roll, spare) =>
         `<tr${spare ? ' class="spare"' : ""}><td class="center">${n}</td>`
-        + `<td class="roll">${escapeHtml(roll)}</td><td class="supp center"></td></tr>`;
+        + `<td class="roll">${escapeHtml(roll)}`
+        + `${roll && repeats && repeats.has(roll) ? ` <span class="seat-re">(R)</span>` : ""}`
+        + `</td><td class="supp center"></td></tr>`;
 
     const n = roster.length;
     slices.forEach(([from, to], ci) => {
@@ -3073,7 +3106,7 @@ function renderSeatingGrid(grid, session) {
 
         const visible = sides.filter((s) => widest[s] > 0);
         visible.forEach((side, i) => {
-            const group = makeSeatGroup(row[side] || [], widest[side]);
+            const group = makeSeatGroup(row[side] || [], widest[side], session.repeatRolls);
             if (i === 0) {
                 group.classList.add("curve-left-max");
                 group.insertAdjacentHTML("afterbegin", `<div class="row-number">R${rowNum}</div>`);
@@ -3089,7 +3122,7 @@ function renderSeatingGrid(grid, session) {
     });
 }
 
-function makeSeatGroup(seats, pad = 0) {
+function makeSeatGroup(seats, pad = 0, repeats) {
     const group = document.createElement("div");
     group.className = "seat-group";
     const list = seats.slice();
@@ -3100,7 +3133,13 @@ function makeSeatGroup(seats, pad = 0) {
             box.className = "seat-box empty spacer";
         } else {
             box.className = "seat-box" + (roll ? "" : " empty");
-            box.textContent = roll || "";
+            if (roll && repeats && repeats.has(roll)) {
+                // re-examination: the roll number carries an (R)
+                box.innerHTML = escapeHtml(roll) + `<span class="seat-re">(R)</span>`;
+                box.classList.add("is-repeat");
+            } else {
+                box.textContent = roll || "";
+            }
         }
         group.appendChild(box);
     });
